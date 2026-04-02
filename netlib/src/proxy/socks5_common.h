@@ -84,6 +84,32 @@ namespace proxy
     };
 
     /**
+     * @brief Variable-length SOCKS5 domain address block.
+     *
+     * Layout:
+     * - [len][domain bytes]
+     */
+    struct socks5_domain_name
+    {
+        /**
+         * @brief Initializes the domain buffer in SOCKS5 format.
+         * @return Length in bytes of the encoded domain block, or 0 on failure.
+         */
+        [[nodiscard]] uint32_t init(const std::string& domain)
+        {
+            if (domain.empty() || domain.length() > 255)
+                return 0;
+
+            length = static_cast<unsigned char>(domain.length());
+            memcpy(address, domain.data(), domain.length());
+            return 1 + static_cast<uint32_t>(domain.length());
+        }
+
+        unsigned char length{};
+        char address[socks5_username_max_length]{};
+    };
+
+    /**
      * @brief Generic SOCKS5 request (e.g., CONNECT, BIND) with templated address type.
      *
      * @tparam T Address structure (IPv4, IPv6, or domain name)
@@ -162,6 +188,19 @@ namespace proxy
         }
 
         /**
+         * @brief Constructor for negotiation with optional auth and destination hostname.
+         */
+        socks5_negotiate_context(const T& remote_srv_address, uint16_t remote_srv_port,
+            std::optional<std::string> socks5_username, std::optional<std::string> socks5_password,
+            std::optional<std::string> destination_hostname)
+            : negotiate_context<T>(remote_srv_address, remote_srv_port),
+            socks5_username(std::move(socks5_username)),
+            socks5_password(std::move(socks5_password)),
+            destination_hostname(std::move(destination_hostname))
+        {
+        }
+
+        /**
          * @brief Constructor for negotiation with mandatory username/password.
          */
         socks5_negotiate_context(const T& remote_address, uint16_t remote_port,
@@ -174,5 +213,6 @@ namespace proxy
 
         std::optional<std::string> socks5_username{ std::nullopt }; ///< Optional username
         std::optional<std::string> socks5_password{ std::nullopt }; ///< Optional password
+        std::optional<std::string> destination_hostname{ std::nullopt }; ///< Optional hostname for remote DNS resolution
     };
 }

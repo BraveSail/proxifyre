@@ -38,32 +38,13 @@ namespace proxy
         };
 
     public:
-        /**
-         * @brief Type aliases for logging, address, negotiation context, and per-I/O context.
-         *
-         * - log_level: Logging level enumeration used for this proxy socket.
-         * - address_type_t: Address type (e.g., IPv4 or IPv6) used by the proxy socket.
-         * - negotiate_context_t: Type holding SOCKS5 negotiation context (credentials, target address, etc.).
-         * - per_io_context_t: Per-I/O context type for managing asynchronous operations.
-         */
         using log_level = netlib::log::log_level;
         using address_type_t = T;
         using negotiate_context_t = socks5_negotiate_context<T>;
         using per_io_context_t = tcp_per_io_context<T>;
 
-        /**
-         * @brief Constructs a SOCKS5 TCP proxy socket.
-         *
-         * Initializes the proxy socket with the given local and remote sockets, negotiation context,
-         * logging level, and optional log stream. The negotiation context typically contains
-         * authentication credentials and the target address/port for the SOCKS5 connection.
-         *
-         * @param local_socket The local client socket handle.
-         * @param remote_socket The remote SOCKS5 proxy server socket handle.
-         * @param negotiate_ctx Unique pointer to the negotiation context (credentials, target, etc.).
-         * @param log_level Logging level for this socket (default: error).
-         * @param log_stream Optional output stream for logging (default: std::nullopt).
-         */
+        static constexpr size_t socks5_username_max_length = 255;
+
         socks5_tcp_proxy_socket(const SOCKET local_socket, const SOCKET remote_socket,
             std::unique_ptr<negotiate_context_t> negotiate_ctx,
             const log_level log_level = log_level::error,
@@ -128,6 +109,12 @@ namespace proxy
         {
             if (io_context->is_local == false)
             {
+                if (io_size == 0)
+                {
+                    tcp_proxy_socket<T>::close_client(true, false);
+                    return;
+                }
+
                 if (current_state_ == socks5_state::login_sent)
                 {
                     current_state_ = socks5_state::login_responded;
@@ -201,43 +188,11 @@ namespace proxy
                         }
                         else // NO AUTHENTICATION REQUIRED is chosen
                         {
-                            connect_request_.cmd = 1;
-                            connect_request_.reserved = 0;
-                            connect_request_.address_type = 1;
-                            connect_request_.dest_address = tcp_proxy_socket<T>::negotiate_ctx_->remote_address;
-                            connect_request_.dest_port = htons(tcp_proxy_socket<T>::negotiate_ctx_->remote_port);
-
-                            io_context_send_negotiate_.wsa_buf.buf = reinterpret_cast<char*>(&connect_request_);
-                            io_context_send_negotiate_.wsa_buf.len = sizeof(socks5_req<T>);
-                            io_context_recv_negotiate_.wsa_buf.buf = reinterpret_cast<char*>(&connect_response_);
-                            io_context_recv_negotiate_.wsa_buf.len = sizeof(socks5_resp<T>);
-
-                            DWORD flags = 0;
-
-                            if ((::WSASend(
-                                tcp_proxy_socket<T>::remote_socket_,
-                                &io_context_send_negotiate_.wsa_buf,
-                                1,
-                                nullptr,
-                                0,
-                                &io_context_send_negotiate_,
-                                nullptr) == SOCKET_ERROR) && (ERROR_IO_PENDING != WSAGetLastError()))
+                            if (auto* negotiate_context_ptr = dynamic_cast<negotiate_context_t*>(tcp_proxy_socket<T>::negotiate_ctx_.get());
+                                !send_connect_request(negotiate_context_ptr))
                             {
                                 tcp_proxy_socket<T>::close_client(false, false);
-                            }
-
-                            current_state_ = socks5_state::connect_sent;
-
-                            if ((::WSARecv(
-                                tcp_proxy_socket<T>::remote_socket_,
-                                &io_context_recv_negotiate_.wsa_buf,
-                                1,
-                                nullptr,
-                                &flags,
-                                &io_context_recv_negotiate_,
-                                nullptr) == SOCKET_ERROR) && (ERROR_IO_PENDING != WSAGetLastError()))
-                            {
-                                tcp_proxy_socket<T>::close_client(true, false);
+                                return;
                             }
                         }
                     }
@@ -253,50 +208,11 @@ namespace proxy
                     }
                     else
                     {
-                        connect_request_.cmd = 1;
-                        connect_request_.reserved = 0;
-                        if constexpr (address_type_t::af_type == AF_INET)
-                        {
-                            connect_request_.address_type = 1; // IPv4
-                        }
-                        else
-                        {
-                            connect_request_.address_type = 4; // IPv6
-                        }
-                        connect_request_.dest_address = tcp_proxy_socket<T>::negotiate_ctx_->remote_address;
-                        connect_request_.dest_port = htons(tcp_proxy_socket<T>::negotiate_ctx_->remote_port);
-
-                        io_context_send_negotiate_.wsa_buf.buf = reinterpret_cast<char*>(&connect_request_);
-                        io_context_send_negotiate_.wsa_buf.len = sizeof(socks5_req<T>);
-                        io_context_recv_negotiate_.wsa_buf.buf = reinterpret_cast<char*>(&connect_response_);
-                        io_context_recv_negotiate_.wsa_buf.len = sizeof(socks5_resp<T>);
-
-                        DWORD flags = 0;
-
-                        if ((::WSASend(
-                            tcp_proxy_socket<T>::remote_socket_,
-                            &io_context_send_negotiate_.wsa_buf,
-                            1,
-                            nullptr,
-                            0,
-                            &io_context_send_negotiate_,
-                            nullptr) == SOCKET_ERROR) && (ERROR_IO_PENDING != WSAGetLastError()))
+                        if (auto* negotiate_context_ptr = dynamic_cast<negotiate_context_t*>(tcp_proxy_socket<T>::negotiate_ctx_.get());
+                            !send_connect_request(negotiate_context_ptr))
                         {
                             tcp_proxy_socket<T>::close_client(false, false);
-                        }
-
-                        current_state_ = socks5_state::connect_sent;
-
-                        if ((::WSARecv(
-                            tcp_proxy_socket<T>::remote_socket_,
-                            &io_context_recv_negotiate_.wsa_buf,
-                            1,
-                            nullptr,
-                            &flags,
-                            &io_context_recv_negotiate_,
-                            nullptr) == SOCKET_ERROR) && (ERROR_IO_PENDING != WSAGetLastError()))
-                        {
-                            tcp_proxy_socket<T>::close_client(true, false);
+                            return;
                         }
                     }
                 }
@@ -339,8 +255,91 @@ namespace proxy
         socks5_ident_req<2> ident_req_{};
         socks5_ident_resp ident_resp_{};
         socks5_req<address_type_t> connect_request_;
+        socks5_req<socks5_domain_name> connect_request_domain_{};
         socks5_resp<address_type_t> connect_response_;
         socks5_username_auth username_auth_{};
+
+        bool send_connect_request(const negotiate_context_t* negotiate_context_ptr)
+        {
+            if (!negotiate_context_ptr)
+                return false;
+
+            DWORD flags = 0;
+
+            io_context_recv_negotiate_.wsa_buf.buf = reinterpret_cast<char*>(&connect_response_);
+            io_context_recv_negotiate_.wsa_buf.len = sizeof(socks5_resp<address_type_t>);
+
+            if (negotiate_context_ptr->destination_hostname.has_value() &&
+                !negotiate_context_ptr->destination_hostname->empty())
+            {
+                connect_request_domain_.cmd = 1;
+                connect_request_domain_.reserved = 0;
+                connect_request_domain_.address_type = 3; // Domain name
+
+                const auto domain_size = connect_request_domain_.dest_address.init(
+                    negotiate_context_ptr->destination_hostname.value());
+
+                if (domain_size == 0)
+                {
+                    NETLIB_ERROR("SOCKS5H hostname is empty or exceeds RFC length limits");
+                    return false;
+                }
+
+                connect_request_domain_.dest_port = htons(tcp_proxy_socket<T>::negotiate_ctx_->remote_port);
+
+                io_context_send_negotiate_.wsa_buf.buf = reinterpret_cast<char*>(&connect_request_domain_);
+                io_context_send_negotiate_.wsa_buf.len = 4 + domain_size + sizeof(unsigned short);
+
+                NETLIB_INFO("SOCKS5H using remote DNS resolution for host: {}",
+                    negotiate_context_ptr->destination_hostname.value());
+            }
+            else
+            {
+                connect_request_.cmd = 1;
+                connect_request_.reserved = 0;
+                if constexpr (address_type_t::af_type == AF_INET)
+                {
+                    connect_request_.address_type = 1; // IPv4
+                }
+                else
+                {
+                    connect_request_.address_type = 4; // IPv6
+                }
+                connect_request_.dest_address = tcp_proxy_socket<T>::negotiate_ctx_->remote_address;
+                connect_request_.dest_port = htons(tcp_proxy_socket<T>::negotiate_ctx_->remote_port);
+
+                io_context_send_negotiate_.wsa_buf.buf = reinterpret_cast<char*>(&connect_request_);
+                io_context_send_negotiate_.wsa_buf.len = sizeof(socks5_req<T>);
+            }
+
+            if ((::WSASend(
+                tcp_proxy_socket<T>::remote_socket_,
+                &io_context_send_negotiate_.wsa_buf,
+                1,
+                nullptr,
+                0,
+                &io_context_send_negotiate_,
+                nullptr) == SOCKET_ERROR) && (ERROR_IO_PENDING != WSAGetLastError()))
+            {
+                return false;
+            }
+
+            current_state_ = socks5_state::connect_sent;
+
+            if ((::WSARecv(
+                tcp_proxy_socket<T>::remote_socket_,
+                &io_context_recv_negotiate_.wsa_buf,
+                1,
+                nullptr,
+                &flags,
+                &io_context_recv_negotiate_,
+                nullptr) == SOCKET_ERROR) && (ERROR_IO_PENDING != WSAGetLastError()))
+            {
+                return false;
+            }
+
+            return true;
+        }
 
     protected:
         /**

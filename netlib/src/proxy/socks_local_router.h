@@ -85,9 +85,68 @@ namespace proxy
         using http_tcp_proxy_server = tcp_proxy_server<http_tcp_proxy_socket<net::ip_address_v4>>;
 
         /**
+         * @brief Redirect target for a TCP flow, including optional hostname recovered from DNS.
+         */
+        struct tcp_destination_info
+        {
+            net::ip_endpoint<net::ip_address_v4> endpoint;
+            std::optional<std::string> hostname{ std::nullopt };
+        };
+
+        /**
+         * @brief Key for tracking pending DNS queries until a response arrives.
+         */
+        struct dns_query_key
+        {
+            net::ip_address_v4 client_ip;
+            uint16_t client_port{};
+            net::ip_address_v4 dns_server_ip;
+            uint16_t transaction_id{};
+
+            bool operator<(const dns_query_key& other) const noexcept
+            {
+                return std::tie(client_ip, client_port, dns_server_ip, transaction_id) <
+                    std::tie(other.client_ip, other.client_port, other.dns_server_ip, other.transaction_id);
+            }
+        };
+
+        /**
+         * @brief Pending DNS query data captured from an outbound DNS request.
+         */
+        struct dns_query_value
+        {
+            unsigned long process_id{};
+            std::string hostname;
+            std::chrono::steady_clock::time_point created_at{ std::chrono::steady_clock::now() };
+        };
+
+        /**
+         * @brief Key for mapping a resolved IP back to a hostname for a specific process.
+         */
+        struct dns_resolution_key
+        {
+            unsigned long process_id{};
+            net::ip_address_v4 resolved_ip;
+
+            bool operator<(const dns_resolution_key& other) const noexcept
+            {
+                return std::tie(process_id, resolved_ip) < std::tie(other.process_id, other.resolved_ip);
+            }
+        };
+
+        /**
+         * @brief Cached DNS resolution data.
+         */
+        struct dns_resolution_value
+        {
+            std::string hostname;
+            std::chrono::steady_clock::time_point expires_at{ std::chrono::steady_clock::now() };
+        };
+
+        /**
          * @brief Stores a mapping of TCP ports to their corresponding IP endpoints.
          */
-        std::unordered_map<uint16_t, net::ip_endpoint<net::ip_address_v4>> tcp_mapper_;
+        std::unordered_map<uint16_t, tcp_destination_info> tcp_mapper_;
 
         /**
          * @brief Stores the set of UDP ports being mapped.
@@ -103,6 +162,21 @@ namespace proxy
          * @brief Mutex to synchronize access to the UDP port mapping.
          */
         std::mutex udp_mapper_lock_;
+
+        /**
+         * @brief Mutex protecting DNS caches.
+         */
+        std::mutex dns_cache_lock_;
+
+        /**
+         * @brief Pending DNS queries waiting for responses.
+         */
+        std::map<dns_query_key, dns_query_value> pending_dns_queries_;
+
+        /**
+         * @brief Resolved DNS names keyed by process and destination IP.
+         */
+        std::map<dns_resolution_key, dns_resolution_value> resolved_dns_names_;
 
         /**
          * @brief I/O completion port for asynchronous operations.
@@ -220,6 +294,268 @@ namespace proxy
         * @brief Atomic boolean to track the active status of the router.
         */
         std::atomic_bool is_active_{ false };
+
+        static constexpr auto dns_pending_ttl_ = std::chrono::seconds(30);
+        static constexpr auto dns_min_resolution_ttl_ = std::chrono::seconds(5);
+
+        void purge_dns_cache_entries_locked()
+        {
+            const auto now = std::chrono::steady_clock::now();
+
+            for (auto it = pending_dns_queries_.begin(); it != pending_dns_queries_.end();)
+            {
+                if (now - it->second.created_at > dns_pending_ttl_)
+                {
+                    it = pending_dns_queries_.erase(it);
+                }
+                else
+                {
+                    ++it;
+                }
+            }
+
+            for (auto it = resolved_dns_names_.begin(); it != resolved_dns_names_.end();)
+            {
+                if (it->second.expires_at <= now)
+                {
+                    it = resolved_dns_names_.erase(it);
+                }
+                else
+                {
+                    ++it;
+                }
+            }
+        }
+
+        bool parse_dns_name(const uint8_t* const dns_payload, const size_t payload_size,
+                            size_t& offset, std::string& hostname, const size_t depth = 0) const
+        {
+            if (depth > 8 || offset >= payload_size)
+            {
+                return false;
+            }
+
+            auto current_offset = offset;
+            auto first_label = true;
+
+            for (size_t labels = 0; current_offset < payload_size && labels < 128; ++labels)
+            {
+                const auto length = dns_payload[current_offset];
+
+                if (length == 0)
+                {
+                    offset = current_offset + 1;
+                    return true;
+                }
+
+                if ((length & 0xC0U) == 0xC0U)
+                {
+                    if (current_offset + 1 >= payload_size)
+                    {
+                        return false;
+                    }
+
+                    const auto pointer_offset = static_cast<size_t>(((length & 0x3FU) << 8U)
+                        | dns_payload[current_offset + 1]);
+
+                    if (pointer_offset >= payload_size)
+                    {
+                        return false;
+                    }
+
+                    offset = current_offset + 2;
+                    auto nested_offset = pointer_offset;
+                    std::string suffix;
+
+                    if (!parse_dns_name(dns_payload, payload_size, nested_offset, suffix, depth + 1))
+                    {
+                        return false;
+                    }
+
+                    if (!suffix.empty())
+                    {
+                        if (!first_label)
+                        {
+                            hostname.push_back('.');
+                        }
+
+                        hostname += suffix;
+                    }
+
+                    return true;
+                }
+
+                if ((length & 0xC0U) != 0)
+                {
+                    return false;
+                }
+
+                ++current_offset;
+
+                if (current_offset + length > payload_size)
+                {
+                    return false;
+                }
+
+                if (!first_label)
+                {
+                    hostname.push_back('.');
+                }
+
+                hostname.append(reinterpret_cast<const char*>(dns_payload + current_offset), length);
+                current_offset += length;
+                first_label = false;
+            }
+
+            return false;
+        }
+
+        void cache_dns_query(const iphdr* const ip_header, const udphdr* const udp_header, const unsigned long process_id,
+                             const uint8_t* const dns_payload, const size_t payload_size)
+        {
+            if (payload_size < sizeof(dns_header))
+            {
+                return;
+            }
+
+            const auto* const header = reinterpret_cast<const dns_header*>(dns_payload);
+
+            if ((ntohs(header->flags) & 0x8000U) != 0 || ntohs(header->qdcount) == 0)
+            {
+                return;
+            }
+
+            auto offset = sizeof(dns_header);
+            std::string hostname;
+
+            if (!parse_dns_name(dns_payload, payload_size, offset, hostname) || hostname.empty())
+            {
+                return;
+            }
+
+            if (offset + sizeof(qr_record) > payload_size)
+            {
+                return;
+            }
+
+            std::scoped_lock lock(dns_cache_lock_);
+            purge_dns_cache_entries_locked();
+
+            pending_dns_queries_[dns_query_key{
+                net::ip_address_v4(ip_header->ip_src),
+                ntohs(udp_header->th_sport),
+                net::ip_address_v4(ip_header->ip_dst),
+                ntohs(header->id)
+            }] = dns_query_value{ process_id, hostname, std::chrono::steady_clock::now() };
+        }
+
+        void cache_dns_response(const iphdr* const ip_header, const udphdr* const udp_header,
+                                const uint8_t* const dns_payload, const size_t payload_size)
+        {
+            if (payload_size < sizeof(dns_header))
+            {
+                return;
+            }
+
+            const auto* const header = reinterpret_cast<const dns_header*>(dns_payload);
+
+            if ((ntohs(header->flags) & 0x8000U) == 0 || ntohs(header->ancount) == 0)
+            {
+                return;
+            }
+
+            std::scoped_lock lock(dns_cache_lock_);
+            purge_dns_cache_entries_locked();
+
+            const dns_query_key key{
+                net::ip_address_v4(ip_header->ip_dst),
+                ntohs(udp_header->th_dport),
+                net::ip_address_v4(ip_header->ip_src),
+                ntohs(header->id)
+            };
+
+            const auto query_it = pending_dns_queries_.find(key);
+
+            if (query_it == pending_dns_queries_.end())
+            {
+                return;
+            }
+
+            auto offset = sizeof(dns_header);
+
+            for (size_t question_index = 0; question_index < ntohs(header->qdcount); ++question_index)
+            {
+                std::string ignored_hostname;
+
+                if (!parse_dns_name(dns_payload, payload_size, offset, ignored_hostname)
+                    || offset + sizeof(qr_record) > payload_size)
+                {
+                    pending_dns_queries_.erase(query_it);
+                    return;
+                }
+
+                offset += sizeof(qr_record);
+            }
+
+            const auto now = std::chrono::steady_clock::now();
+            const auto hostname = query_it->second.hostname;
+            const auto process_id = query_it->second.process_id;
+
+            for (size_t answer_index = 0; answer_index < ntohs(header->ancount); ++answer_index)
+            {
+                std::string ignored_name;
+
+                if (!parse_dns_name(dns_payload, payload_size, offset, ignored_name)
+                    || offset + sizeof(res_record) > payload_size)
+                {
+                    break;
+                }
+
+                const auto* const answer = reinterpret_cast<const res_record*>(dns_payload + offset);
+                offset += sizeof(res_record);
+
+                const auto rdlength = ntohs(answer->rdlength);
+
+                if (offset + rdlength > payload_size)
+                {
+                    break;
+                }
+
+                if (ntohs(answer->type) == 1 && ntohs(answer->clas) == 1 && rdlength == sizeof(IN_ADDR))
+                {
+                    IN_ADDR resolved_address{};
+                    memcpy(&resolved_address, dns_payload + offset, sizeof(IN_ADDR));
+
+                    auto ttl = std::chrono::seconds(ntohl(answer->ttl));
+                    if (ttl < dns_min_resolution_ttl_)
+                    {
+                        ttl = dns_min_resolution_ttl_;
+                    }
+
+                    resolved_dns_names_[dns_resolution_key{ process_id, net::ip_address_v4(resolved_address) }] =
+                        dns_resolution_value{ hostname, now + ttl };
+                }
+
+                offset += rdlength;
+            }
+
+            pending_dns_queries_.erase(query_it);
+        }
+
+        std::optional<std::string> lookup_dns_hostname(const unsigned long process_id,
+                                                       const net::ip_address_v4& destination_ip)
+        {
+            std::scoped_lock lock(dns_cache_lock_);
+            purge_dns_cache_entries_locked();
+
+            if (const auto it = resolved_dns_names_.find(dns_resolution_key{ process_id, destination_ip });
+                it != resolved_dns_names_.end())
+            {
+                return it->second.hostname;
+            }
+
+            return std::nullopt;
+        }
 
     public:
         enum supported_protocols : uint8_t
@@ -724,10 +1060,11 @@ namespace proxy
                                                           {
                                                               NETLIB_LOG(log_level::info,
                                                                         "TCP Redirect entry was found for the {} : {} is {} : {}",
-                                                                        address, port, net::ip_address_v4{it->second.ip}, it->second.port);
+                                                                        address, port, net::ip_address_v4{it->second.endpoint.ip}, it->second.endpoint.port);
 
-                                                              auto remote_address = it->second.ip;
-                                                              auto remote_port = it->second.port;
+                                                              auto remote_address = it->second.endpoint.ip;
+                                                              auto remote_port = it->second.endpoint.port;
+                                                              auto destination_hostname = it->second.hostname;
 
                                                               tcp_mapper_.erase(it);
 
@@ -740,7 +1077,8 @@ namespace proxy
                                                                           : std::nullopt,
                                                                       cred_pair
                                                                           ? std::optional(cred_pair.value().second)
-                                                                          : std::nullopt));
+                                                                          : std::nullopt,
+                                                                      destination_hostname));
                                                           }
 
                                                           return std::make_tuple(net::ip_address_v4{}, 0, nullptr);
@@ -890,10 +1228,11 @@ namespace proxy
                         {
                             NETLIB_LOG(log_level::info,
                                       "HTTP TCP Redirect entry was found for the {} : {} is {} : {}",
-                                      address, port, net::ip_address_v4{it->second.ip}, it->second.port);
+                                      address, port, net::ip_address_v4{it->second.endpoint.ip}, it->second.endpoint.port);
 
-                            auto remote_address = it->second.ip;
-                            auto remote_port = it->second.port;
+                            auto remote_address = it->second.endpoint.ip;
+                            auto remote_port = it->second.endpoint.port;
+                            auto destination_hostname = it->second.hostname;
 
                             tcp_mapper_.erase(it);
 
@@ -905,7 +1244,8 @@ namespace proxy
                                         : std::nullopt,
                                     cred_pair
                                         ? std::optional(cred_pair.value().second)
-                                        : std::nullopt));
+                                        : std::nullopt,
+                                    destination_hostname));
                         }
 
                         return std::make_tuple(net::ip_address_v4{}, 0, nullptr);
@@ -1256,13 +1596,10 @@ namespace proxy
             auto* const ip_header = reinterpret_cast<iphdr_ptr>(ethernet_header + 1);
             const auto* const udp_header = reinterpret_cast<udphdr_ptr>(reinterpret_cast<PUCHAR>(ip_header)
                 + sizeof(DWORD) * ip_header->ip_hl);
-
-            // If the destination port is 53 (DNS), allow the packet to pass through without redirection
-            // TODO: We might consider adding a DNS proxy in the future
-            if (ntohs(udp_header->th_dport) == 53)
-            {
-                return packet_filter::packet_action{ packet_filter::packet_action::action_type::pass };
-            }
+            const auto* const dns_payload = reinterpret_cast<const uint8_t*>(udp_header + 1);
+            const auto udp_payload_size = ntohs(udp_header->length) >= sizeof(udphdr)
+                ? static_cast<size_t>(ntohs(udp_header->length) - sizeof(udphdr))
+                : 0U;
 
             // If the packet is from a known proxy port, process for server-to-client redirection
             if (is_udp_proxy_port(ntohs(udp_header->th_sport)))
@@ -1272,6 +1609,33 @@ namespace proxy
                     log_packet_to_pcap(buffer);
                     return packet_filter::packet_action{ packet_filter::packet_action::action_type::revert };
                 }
+            }
+
+            if (ntohs(udp_header->th_sport) == 53)
+            {
+                cache_dns_response(ip_header, udp_header, dns_payload, udp_payload_size);
+                return packet_filter::packet_action{ packet_filter::packet_action::action_type::pass };
+            }
+
+            if (ntohs(udp_header->th_dport) == 53)
+            {
+                auto process = process_lookup_v4_.lookup_process_for_udp<false>(net::ip_endpoint<net::ip_address_v4>{
+                    ip_header->ip_src, ntohs(udp_header->th_sport)
+                });
+
+                if (!process && postponed)
+                {
+                    process = process_lookup_v4_.lookup_process_for_udp<true>(net::ip_endpoint<net::ip_address_v4>{
+                        ip_header->ip_src, ntohs(udp_header->th_sport)
+                    });
+                }
+
+                if (process)
+                {
+                    cache_dns_query(ip_header, udp_header, process->id, dns_payload, udp_payload_size);
+                }
+
+                return packet_filter::packet_action{ packet_filter::packet_action::action_type::pass };
             }
 
             auto process = process_lookup_v4_.
@@ -1293,6 +1657,9 @@ namespace proxy
                     return std::nullopt;
                 }
             }
+
+            if (!process)
+                return packet_filter::packet_action{ packet_filter::packet_action::action_type::pass };
 
             if (process->excluded || process->bypass_udp)
                 return packet_filter::packet_action{ packet_filter::packet_action::action_type::pass };
@@ -1387,6 +1754,9 @@ namespace proxy
                 }
             }
 
+            if (!process)
+                return packet_filter::packet_action{ packet_filter::packet_action::action_type::pass };
+
             if (process->excluded || process->bypass_tcp)
                 return packet_filter::packet_action{ packet_filter::packet_action::action_type::pass };
 
@@ -1395,15 +1765,29 @@ namespace proxy
                 // If this is a SYN packet (connection initiation), map the source port to the destination endpoint
                 if ((tcp_header->th_flags & (TH_SYN | TH_ACK)) == TH_SYN)
                 {
-                    std::scoped_lock lock(tcp_mapper_lock_);
-                    tcp_mapper_[ntohs(tcp_header->th_sport)] =
-                        net::ip_endpoint(net::ip_address_v4(ip_header->ip_dst),
-                            ntohs(tcp_header->th_dport));
+                    auto destination_info = tcp_destination_info{
+                        net::ip_endpoint(net::ip_address_v4(ip_header->ip_dst), ntohs(tcp_header->th_dport)),
+                        lookup_dns_hostname(process->id, net::ip_address_v4(ip_header->ip_dst))
+                    };
 
-                    NETLIB_LOG(log_level::info,
-                        "Redirecting TCP: {} : {} -> {} : {}",
-                        net::ip_address_v4(ip_header->ip_src), ntohs(tcp_header->th_sport),
-                        net::ip_address_v4(ip_header->ip_dst), ntohs(tcp_header->th_dport));
+                    std::scoped_lock lock(tcp_mapper_lock_);
+                    tcp_mapper_[ntohs(tcp_header->th_sport)] = destination_info;
+
+                    if (destination_info.hostname)
+                    {
+                        NETLIB_LOG(log_level::info,
+                            "Redirecting TCP: {} : {} -> {} : {} ({})",
+                            net::ip_address_v4(ip_header->ip_src), ntohs(tcp_header->th_sport),
+                            net::ip_address_v4(ip_header->ip_dst), ntohs(tcp_header->th_dport),
+                            destination_info.hostname.value());
+                    }
+                    else
+                    {
+                        NETLIB_LOG(log_level::info,
+                            "Redirecting TCP: {} : {} -> {} : {}",
+                            net::ip_address_v4(ip_header->ip_src), ntohs(tcp_header->th_sport),
+                            net::ip_address_v4(ip_header->ip_dst), ntohs(tcp_header->th_dport));
+                    }
                 }
 
                 // Attempt to process the packet for client-to-server redirection

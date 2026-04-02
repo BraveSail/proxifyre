@@ -76,6 +76,12 @@ namespace proxy
         {
             if (io_context->is_local == false && current_state_ == http_state::connect_sent)
             {
+                if (io_size == 0)
+                {
+                    tcp_proxy_socket<T>::close_client(true, false);
+                    return;
+                }
+
                 response_received_ += io_size;
 
                 // Check if we have a complete HTTP response (ends with \r\n\r\n)
@@ -207,11 +213,15 @@ namespace proxy
                     // Build target address string from the negotiate context
                     const auto& remote_addr = negotiate_context_ptr->remote_address;
                     const auto remote_port = negotiate_context_ptr->remote_port;
-                    const std::string target = std::string(remote_addr) + ":" + std::to_string(remote_port);
+                    const std::string target = negotiate_context_ptr->destination_hostname.has_value() &&
+                        !negotiate_context_ptr->destination_hostname->empty()
+                        ? negotiate_context_ptr->destination_hostname.value() + ":" + std::to_string(remote_port)
+                        : std::string(remote_addr) + ":" + std::to_string(remote_port);
 
                     // Build HTTP CONNECT request
                     connect_request_str_ = "CONNECT " + target + " HTTP/1.1\r\n"
-                        "Host: " + target + "\r\n";
+                        "Host: " + target + "\r\n"
+                        "Proxy-Connection: Keep-Alive\r\n";
 
                     // Add Proxy-Authorization if credentials are provided
                     if (negotiate_context_ptr->username.has_value() &&
@@ -236,6 +246,13 @@ namespace proxy
 
                     NETLIB_DEBUG("Sending HTTP CONNECT request ({} bytes): CONNECT {}", 
                         connect_request_str_.size(), target);
+
+                    if (negotiate_context_ptr->destination_hostname.has_value() &&
+                        !negotiate_context_ptr->destination_hostname->empty())
+                    {
+                        NETLIB_INFO("HTTP CONNECT using remote DNS target: {}",
+                            negotiate_context_ptr->destination_hostname.value());
+                    }
 
                     if ((::WSASend(
                         tcp_proxy_socket<T>::remote_socket_,
