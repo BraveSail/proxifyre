@@ -91,6 +91,25 @@ public:
     ) const;
 
     /**
+     * @brief Adds a proxy to the gateway with the specified proxy type.
+     * @param endpoint The proxy endpoint in "IP:Port" format.
+     * @param type The proxy protocol type (socks5, socks5h, http).
+     * @param protocol The supported protocol(s) for the proxy.
+     * @param start Whether to start the proxy immediately.
+     * @param login Optional username for authentication.
+     * @param password Optional password for authentication.
+     * @return A handle (LONG_PTR) to the proxy instance, or -1 on failure.
+     */
+    [[nodiscard]] LONG_PTR add_proxy(
+        const std::string& endpoint,
+        proxy_type_mx type,
+        supported_protocols_mx protocol,
+        bool start = false,
+        const std::string& login = "",
+        const std::string& password = ""
+    ) const;
+
+    /**
      * @brief Associates a process name with a specific proxy.
      * @param process_name The process name to associate.
      * @param proxy_id The handle of the proxy to associate with.

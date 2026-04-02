@@ -1,6 +1,6 @@
-# ProxiFyre: SOCKS5 Proxifier for Windows with UDP Support
+# ProxiFyre: SOCKS5/HTTP Proxifier for Windows with UDP Support
 
-**ProxiFyre** enables applications without native proxy support to transparently route both TCP and UDP traffic through a SOCKS5 proxy, enabling advanced use cases such as **QUIC over SOCKS**—a capability not supported by modern web browsers.
+**ProxiFyre** enables applications without native proxy support to transparently route both TCP and UDP traffic through a SOCKS5, SOCKS5h, or HTTP CONNECT proxy, enabling advanced use cases such as **QUIC over SOCKS**—a capability not supported by modern web browsers.
 
 Built on top of the Windows Packet Filter `socksify` demo, ProxiFyre significantly extends its foundational functionality with production-ready enhancements. In addition to full UDP support, ProxiFyre allows users to manage **multiple SOCKS5 proxy instances** simultaneously.
 
@@ -17,7 +17,9 @@ As of **v2.2.0**, ProxiFyre supports **LAN bypass**, allowing local network traf
 The application uses a configuration file named `app-config.json`. This JSON file should contain configurations for different applications. Each configuration object should have the following properties:
 
 - **appNames**: An array of strings representing the names of applications this configuration applies to.
-- **socks5ProxyEndpoint**: A string that specifies the SOCKS5 proxy endpoint.
+- **socks5ProxyEndpoint**: A string that specifies the SOCKS5 proxy endpoint (legacy field).
+- **proxyEndpoint** *(new in v2.3.0)*: A string that specifies the proxy endpoint (takes precedence over `socks5ProxyEndpoint`).
+- **proxyType** *(new in v2.3.0)*: The proxy protocol type: `"socks5"` (default), `"socks5h"`, or `"http"`.
 - **username**: A string that specifies the username for the proxy (optional).
 - **password**: A string that specifies the password for the proxy (optional).
 - **supportedProtocols**: An array of strings specifying the supported protocols (e.g., `"TCP"`, `"UDP"`).
@@ -104,6 +106,51 @@ Example:
 ### SOCKS5 Proxy Authorization
 
 If the SOCKS5 proxy does not support authorization, you can skip the `username` and `password` fields in the configuration.
+
+---
+
+### Proxy Types (new in v2.3.0)
+
+ProxiFyre supports multiple proxy protocol types via the `proxyType` field:
+
+| Type | Description |
+|------|-------------|
+| `socks5` | Standard SOCKS5 proxy (default, RFC 1928). Supports TCP and UDP. |
+| `socks5h` | SOCKS5 with remote DNS resolution. Behaves identically to `socks5` at the packet level. Supports TCP and UDP. |
+| `http` | HTTP CONNECT tunnel proxy. **TCP only** — UDP is not supported. Supports optional `Proxy-Authorization: Basic` authentication. |
+
+You can specify the proxy type using the `proxyType` field in the proxy configuration. If omitted, `socks5` is used by default.
+
+You may also use `proxyEndpoint` instead of `socks5ProxyEndpoint` for the proxy address — both are accepted, and `proxyEndpoint` takes precedence if both are present.
+
+Example:
+
+```json
+{
+  "logLevel": "Info",
+  "proxies": [
+    {
+      "appNames": ["chrome"],
+      "socks5ProxyEndpoint": "127.0.0.1:1080",
+      "supportedProtocols": ["TCP", "UDP"]
+    },
+    {
+      "appNames": ["firefox"],
+      "proxyEndpoint": "127.0.0.1:1080",
+      "proxyType": "socks5h",
+      "supportedProtocols": ["TCP"]
+    },
+    {
+      "appNames": ["curl"],
+      "proxyEndpoint": "10.0.0.1:8080",
+      "proxyType": "http",
+      "username": "user",
+      "password": "pass",
+      "supportedProtocols": ["TCP"]
+    }
+  ]
+}
+```
 
 ---
 

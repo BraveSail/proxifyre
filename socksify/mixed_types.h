@@ -49,6 +49,19 @@ enum class supported_protocols_mx : uint8_t
 };
 
 /**
+ * @brief Specifies the proxy protocol type.
+ */
+enum class proxy_type_mx : uint8_t
+{
+    /// <summary>Standard SOCKS5 proxy (RFC 1928).</summary>
+    socks5 = 0,
+    /// <summary>SOCKS5 with remote DNS resolution (same as socks5 at packet level).</summary>
+    socks5h = 1,
+    /// <summary>HTTP CONNECT proxy (TCP only).</summary>
+    http = 2
+};
+
+/**
  * @brief Enumerates the types of events that can occur in the proxy gateway.
  */
 enum class event_type_mx : uint32_t

@@ -2,6 +2,46 @@
 namespace proxy
 {
     /**
+     * @enum proxy_type
+     * @brief Enumerates the supported proxy protocol types.
+     */
+    enum class proxy_type : uint8_t
+    {
+        socks5,   ///< Standard SOCKS5 proxy (RFC 1928)
+        socks5h,  ///< SOCKS5 with remote DNS resolution (behaves same as socks5 at packet level)
+        http      ///< HTTP CONNECT proxy (TCP only)
+    };
+
+    /**
+     * @brief Type-erased interface for TCP proxy servers.
+     *
+     * Allows storing different tcp_proxy_server template instantiations
+     * (e.g., SOCKS5 and HTTP) in the same container.
+     */
+    struct tcp_proxy_server_base
+    {
+        virtual ~tcp_proxy_server_base() = default;
+        virtual bool start() = 0;
+        virtual void stop() = 0;
+        [[nodiscard]] virtual uint16_t proxy_port() const = 0;
+    };
+
+    /**
+     * @brief Concrete type-erased wrapper for a tcp_proxy_server<T>.
+     */
+    template<typename T>
+    struct tcp_proxy_server_wrapper final : tcp_proxy_server_base
+    {
+        std::unique_ptr<tcp_proxy_server<T>> server;
+
+        explicit tcp_proxy_server_wrapper(std::unique_ptr<tcp_proxy_server<T>> srv)
+            : server(std::move(srv)) {}
+
+        bool start() override { return server->start(); }
+        void stop() override { server->stop(); }
+        [[nodiscard]] uint16_t proxy_port() const override { return server->proxy_port(); }
+    };
+    /**
      * @class socks_local_router
      * @brief Implements a local router for handling SOCKS proxy traffic.
      *
@@ -40,6 +80,11 @@ namespace proxy
         using s5_udp_proxy_server = socks5_local_udp_proxy_server<socks5_udp_proxy_socket<net::ip_address_v4>>;
 
         /**
+         * @brief Type alias for the HTTP CONNECT TCP proxy server specialized for IPv4.
+         */
+        using http_tcp_proxy_server = tcp_proxy_server<http_tcp_proxy_socket<net::ip_address_v4>>;
+
+        /**
          * @brief Stores a mapping of TCP ports to their corresponding IP endpoints.
          */
         std::unordered_map<uint16_t, net::ip_endpoint<net::ip_address_v4>> tcp_mapper_;
@@ -70,9 +115,9 @@ namespace proxy
         std::optional<pcap::pcap_stream_logger> pcap_logger_;
 
         /**
-         * @brief Vector storing pairs of unique pointers to TCP and UDP proxy servers.
+         * @brief Vector storing pairs of type-erased TCP proxy servers and UDP proxy servers.
          */
-        std::vector<std::pair<std::unique_ptr<s5_tcp_proxy_server>, std::unique_ptr<s5_udp_proxy_server>>> proxy_servers_;
+        std::vector<std::pair<std::unique_ptr<tcp_proxy_server_base>, std::unique_ptr<s5_udp_proxy_server>>> proxy_servers_;
 
         /**
          * @brief Maps proxy indexes to their corresponding process names (sorted by proxy ID).
@@ -767,8 +812,13 @@ namespace proxy
                 // Lock the mutex to safely add the proxy servers to the shared data structure
                 std::scoped_lock lock(lock_);
 
+                std::unique_ptr<tcp_proxy_server_base> tcp_wrapper = socks_tcp_proxy_server
+                    ? std::make_unique<tcp_proxy_server_wrapper<socks5_tcp_proxy_socket<net::ip_address_v4>>>(
+                        std::move(socks_tcp_proxy_server))
+                    : nullptr;
+
                 proxy_servers_.emplace_back(
-                    std::move(socks_tcp_proxy_server), std::move(socks_udp_proxy_server));
+                    std::move(tcp_wrapper), std::move(socks_udp_proxy_server));
 
                 return proxy_servers_.size() - 1; // Return the index of the added proxy server
             }
@@ -779,6 +829,120 @@ namespace proxy
             }
 
             return {}; // Return nullopt in case of error or exception
+        }
+
+        /**
+         * Add an HTTP CONNECT proxy and optionally starts it.
+         * HTTP CONNECT only supports TCP tunneling - no UDP support.
+         * @param endpoint string representing the endpoint of the HTTP proxy server.
+         * @param cred_pair optional pair of strings representing username and password for Proxy-Authorization.
+         * @param start boolean flag to start the proxy server after creating it.
+         * @return an optional value containing the index of the added proxy server if successful, std::nullopt otherwise.
+         */
+        std::optional<size_t> add_http_proxy(
+            const std::string& endpoint,
+            const std::optional<std::pair<std::string, std::string>>& cred_pair,
+            const bool start = false
+        )
+        {
+            using namespace std::string_literals;
+
+            auto proxy_endpoint = parse_endpoint(endpoint);
+
+            if (!proxy_endpoint)
+            {
+                NETLIB_LOG(log_level::error, "Failed to parse the HTTP proxy endpoint {}", endpoint);
+                return {};
+            }
+
+            // HTTP CONNECT only supports TCP
+            auto create_filter = [](const uint8_t protocol, const ndisapi::direction_t direction,
+                const net::ip_address_v4& address, const uint16_t port)
+            {
+                ndisapi::filter<net::ip_address_v4> filter;
+                filter.set_protocol(protocol)
+                    .set_direction(direction)
+                    .set_action(ndisapi::action_t::pass)
+                    .set_dest_address(net::ip_subnet{ address, net::ip_address_v4{"255.255.255.255"} })
+                    .set_dest_port(std::make_pair(port, port));
+                return filter;
+            };
+
+            const auto tcp_out_filter = create_filter(IPPROTO_TCP, ndisapi::direction_t::out, proxy_endpoint.value().ip,
+                                                      proxy_endpoint.value().port);
+            const auto tcp_in_filter = create_filter(IPPROTO_TCP, ndisapi::direction_t::in, proxy_endpoint.value().ip,
+                                                     proxy_endpoint.value().port);
+
+            static_filters_.add_filter_back(tcp_out_filter);
+            static_filters_.add_filter_back(tcp_in_filter);
+
+            try
+            {
+                auto http_proxy_server_ptr = std::make_unique<http_tcp_proxy_server>(
+                    0, io_port_, [this, endpoint = proxy_endpoint.value(), cred_pair](
+                    const net::ip_address_v4 address, const uint16_t port)->
+                    std::tuple<net::ip_address_v4, uint16_t, std::unique_ptr<
+                                   http_tcp_proxy_server::negotiate_context_t>>
+                    {
+                        std::scoped_lock lock(tcp_mapper_lock_);
+
+                        if (const auto it = tcp_mapper_.find(port); it != tcp_mapper_.end())
+                        {
+                            NETLIB_LOG(log_level::info,
+                                      "HTTP TCP Redirect entry was found for the {} : {} is {} : {}",
+                                      address, port, net::ip_address_v4{it->second.ip}, it->second.port);
+
+                            auto remote_address = it->second.ip;
+                            auto remote_port = it->second.port;
+
+                            tcp_mapper_.erase(it);
+
+                            return std::make_tuple(endpoint.ip, endpoint.port,
+                                std::make_unique<http_tcp_proxy_server::negotiate_context_t>(
+                                    remote_address, remote_port,
+                                    cred_pair
+                                        ? std::optional(cred_pair.value().first)
+                                        : std::nullopt,
+                                    cred_pair
+                                        ? std::optional(cred_pair.value().second)
+                                        : std::nullopt));
+                        }
+
+                        return std::make_tuple(net::ip_address_v4{}, 0, nullptr);
+                    }, log_level_, log_stream_);
+
+                if (start)
+                {
+                    if (http_proxy_server_ptr)
+                    {
+                        if (!http_proxy_server_ptr->start())
+                        {
+                            NETLIB_LOG(log_level::error, "Failed to start HTTP CONNECT proxy {}", endpoint);
+                            return {};
+                        }
+
+                        NETLIB_LOG(log_level::info,
+                                  "Local HTTP TCP proxy for {} is listening port: {}", endpoint, http_proxy_server_ptr->proxy_port());
+                    }
+                }
+
+                std::scoped_lock lock(lock_);
+
+                std::unique_ptr<tcp_proxy_server_base> tcp_wrapper =
+                    std::make_unique<tcp_proxy_server_wrapper<http_tcp_proxy_socket<net::ip_address_v4>>>(
+                        std::move(http_proxy_server_ptr));
+
+                proxy_servers_.emplace_back(std::move(tcp_wrapper), nullptr);
+
+                return proxy_servers_.size() - 1;
+            }
+            catch (const std::exception& e)
+            {
+                NETLIB_LOG(log_level::error, "An exception was thrown while adding HTTP proxy {} : {}",
+                          endpoint, e.what());
+            }
+
+            return {};
         }
 
         /**

@@ -208,6 +208,65 @@ LONG_PTR socksify_unmanaged::add_socks5_proxy(
 }
 
 /**
+ * @brief Adds a proxy to the gateway with the specified proxy type.
+ * @param endpoint The proxy endpoint in "IP:Port" format.
+ * @param type The proxy protocol type (socks5, socks5h, http).
+ * @param protocol The supported protocol(s) for the proxy.
+ * @param start Whether to start the proxy immediately.
+ * @param login Optional username for authentication.
+ * @param password Optional password for authentication.
+ * @return A handle (LONG_PTR) to the proxy instance, or -1 on failure.
+ */
+LONG_PTR socksify_unmanaged::add_proxy(
+    const std::string& endpoint,
+    const proxy_type_mx type,
+    const supported_protocols_mx protocol,
+    const bool start,
+    const std::string& login,
+    const std::string& password) const
+{
+    using namespace std::string_literals;
+    std::optional<std::pair<std::string, std::string>> cred{ std::nullopt };
+
+    if (!login.empty())
+    {
+        cred = std::make_pair(login, password);
+    }
+
+    if (type == proxy_type_mx::http)
+    {
+        // HTTP CONNECT only supports TCP
+        if (const auto result = proxy_->add_http_proxy(endpoint, cred, start); result)
+        {
+            return static_cast<LONG_PTR>(result.value());
+        }
+        return -1;
+    }
+
+    // socks5 and socks5h use the same implementation at the packet level
+    proxy::socks_local_router::supported_protocols protocols = proxy::socks_local_router::supported_protocols::both;
+    switch (protocol)
+    {
+    case supported_protocols_mx::tcp:
+        protocols = proxy::socks_local_router::supported_protocols::tcp;
+        break;
+    case supported_protocols_mx::udp:
+        protocols = proxy::socks_local_router::supported_protocols::udp;
+        break;
+    case supported_protocols_mx::both:
+        protocols = proxy::socks_local_router::supported_protocols::both;
+        break;
+    }
+
+    if (const auto result = proxy_->add_socks5_proxy(endpoint, protocols, cred, start); result)
+    {
+        return static_cast<LONG_PTR>(result.value());
+    }
+
+    return -1;
+}
+
+/**
  * @brief Associates a process name with a specific proxy.
  * @param process_name The process name to associate.
  * @param proxy_id The handle of the proxy to associate with.

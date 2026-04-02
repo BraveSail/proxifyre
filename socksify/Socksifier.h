@@ -86,6 +86,19 @@ namespace Socksifier
     };
 
     /// <summary>
+    /// Specifies the proxy protocol type.
+    /// </summary>
+    public enum class ProxyType
+    {
+        /// <summary>Standard SOCKS5 proxy (RFC 1928).</summary>
+        SOCKS5,
+        /// <summary>SOCKS5 with remote DNS resolution.</summary>
+        SOCKS5H,
+        /// <summary>HTTP CONNECT proxy (TCP only).</summary>
+        HTTP
+    };
+
+    /// <summary>
     /// Represents a single log entry for Socksifier events.
     /// </summary>
     public ref class LogEntry sealed
@@ -260,6 +273,19 @@ namespace Socksifier
         /// <returns>A handle to the proxy instance.</returns>
         IntPtr AddSocks5Proxy(String^ endpoint, String^ username, String^ password, SupportedProtocolsEnum protocols,
             bool start);
+
+        /// <summary>
+        /// Adds a proxy to the gateway with the specified proxy type.
+        /// </summary>
+        /// <param name="endpoint">The proxy endpoint (IP:Port).</param>
+        /// <param name="username">The username for authentication.</param>
+        /// <param name="password">The password for authentication.</param>
+        /// <param name="proxyType">The proxy protocol type (SOCKS5, SOCKS5H, HTTP).</param>
+        /// <param name="protocols">The supported protocols.</param>
+        /// <param name="start">Whether to start the proxy immediately.</param>
+        /// <returns>A handle to the proxy instance.</returns>
+        IntPtr AddProxy(String^ endpoint, String^ username, String^ password, ProxyType proxyType,
+            SupportedProtocolsEnum protocols, bool start);
 
         /// <summary>
         /// Associates a process name with a specific proxy.

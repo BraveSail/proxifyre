@@ -78,16 +78,23 @@ namespace ProxiFyre
 
             foreach (var appSettings in serviceSettings.Proxies)
             {
-                // Add the defined SOCKS5 proxies
-                var proxy = _socksify.AddSocks5Proxy(appSettings.Socks5ProxyEndpoint, appSettings.Username,
-                    appSettings.Password, appSettings.SupportedProtocolsParse,
-                    true); // Assuming the AddSocks5Proxy method supports a list of protocols
+                // Warn if HTTP proxy is configured with UDP (HTTP CONNECT only supports TCP)
+                if (appSettings.ProxyTypeParse == ProxyType.HTTP && appSettings.SupportedProtocols.Contains("UDP"))
+                    LoggerInstance.Warn(
+                        $"HTTP CONNECT proxy {appSettings.ProxyEndpoint} does not support UDP. UDP protocol will be ignored.");
+
+                // Add the proxy based on its type
+                var proxy = _socksify.AddProxy(
+                    appSettings.ProxyEndpoint, appSettings.Username,
+                    appSettings.Password, appSettings.ProxyTypeParse,
+                    appSettings.SupportedProtocolsParse,
+                    true);
 
                 foreach (var appName in appSettings.AppNames)
                     // Associate the defined application names to the proxies
                     if (proxy.ToInt64() != -1 && _socksify.AssociateProcessNameToProxy(appName, proxy) && _logLevel >= LogLevel.Info)
                         LoggerInstance.Info(
-                            $"Successfully associated {appName} to {appSettings.Socks5ProxyEndpoint} SOCKS5 proxy with protocols {string.Join(", ", appSettings.SupportedProtocols)}!");
+                            $"Successfully associated {appName} to {appSettings.ProxyEndpoint} {appSettings.ProxyTypeString} proxy with protocols {string.Join(", ", appSettings.SupportedProtocols)}!");
             }
 
             foreach (var excludedEntry in serviceSettings.ExcludedList)
@@ -148,9 +155,18 @@ namespace ProxiFyre
         //        },
         //        {
         //            "appNames": ["firefox", "firefox_dev"],
-        //            "socks5ProxyEndpoint": "159.101.205.52:1080",
+        //            "proxyEndpoint": "159.101.205.52:1080",
+        //            "proxyType": "socks5h",
         //            "username": "username2",
         //            "password": "password2",
+        //            "supportedProtocols": ["TCP"]
+        //        },
+        //        {
+        //            "appNames": ["curl"],
+        //            "proxyEndpoint": "10.0.0.1:8080",
+        //            "proxyType": "http",
+        //            "username": "username3",
+        //            "password": "password3",
         //            "supportedProtocols": ["TCP"]
         //        }
         //    ],
@@ -215,17 +231,22 @@ namespace ProxiFyre
             /// Initializes a new instance of the <see cref="AppSettings"/> class.
             /// </summary>
             /// <param name="appNames">List of application names to associate with the proxy.</param>
-            /// <param name="socks5ProxyEndpoint">SOCKS5 proxy endpoint address.</param>
+            /// <param name="socks5ProxyEndpoint">SOCKS5 proxy endpoint address (legacy).</param>
+            /// <param name="proxyEndpoint">Proxy endpoint address (new format).</param>
+            /// <param name="proxyType">Proxy type: socks5, socks5h, or http.</param>
             /// <param name="username">Username for proxy authentication.</param>
             /// <param name="password">Password for proxy authentication.</param>
             /// <param name="supportedProtocols">List of supported protocols (e.g., TCP, UDP).</param>
-            public AppSettings(List<string> appNames, string socks5ProxyEndpoint, string username, string password, List<string> supportedProtocols)
+            public AppSettings(List<string> appNames, string socks5ProxyEndpoint, string proxyEndpoint,
+                string proxyType, string username, string password, List<string> supportedProtocols)
             {
                 AppNames = appNames;
                 Socks5ProxyEndpoint = socks5ProxyEndpoint;
+                ProxyEndpointSetting = proxyEndpoint;
+                ProxyTypeSetting = proxyType;
                 Username = username;
                 Password = password;
-                SupportedProtocols = supportedProtocols;
+                SupportedProtocols = supportedProtocols ?? new List<string>();
             }
 
             /// <summary>
@@ -234,9 +255,34 @@ namespace ProxiFyre
             public List<string> AppNames { get; set; }
 
             /// <summary>
-            /// Gets the SOCKS5 proxy endpoint address.
+            /// Gets the SOCKS5 proxy endpoint address (legacy, kept for backward compatibility).
             /// </summary>
             public string Socks5ProxyEndpoint { get; }
+
+            /// <summary>
+            /// Gets the proxy endpoint address (new format, takes precedence over Socks5ProxyEndpoint).
+            /// </summary>
+            [JsonProperty("proxyEndpoint", NullValueHandling = NullValueHandling.Ignore)]
+            public string ProxyEndpointSetting { get; }
+
+            /// <summary>
+            /// Gets the proxy type string from configuration. Defaults to "socks5".
+            /// Valid values: "socks5", "socks5h", "http".
+            /// </summary>
+            [JsonProperty("proxyType", NullValueHandling = NullValueHandling.Ignore)]
+            public string ProxyTypeSetting { get; }
+
+            /// <summary>
+            /// Gets the effective proxy endpoint, preferring proxyEndpoint over socks5ProxyEndpoint.
+            /// </summary>
+            public string ProxyEndpoint => !string.IsNullOrEmpty(ProxyEndpointSetting)
+                ? ProxyEndpointSetting
+                : Socks5ProxyEndpoint;
+
+            /// <summary>
+            /// Gets the proxy type string for display purposes.
+            /// </summary>
+            public string ProxyTypeString => string.IsNullOrEmpty(ProxyTypeSetting) ? "socks5" : ProxyTypeSetting.ToLowerInvariant();
 
             /// <summary>
             /// Gets the username for proxy authentication.
@@ -252,6 +298,26 @@ namespace ProxiFyre
             /// Gets the list of supported protocols (e.g., TCP, UDP).
             /// </summary>
             public List<string> SupportedProtocols { get; }
+
+            /// <summary>
+            /// Gets the proxy type as an enum value.
+            /// </summary>
+            public ProxyType ProxyTypeParse
+            {
+                get
+                {
+                    switch (ProxyTypeString)
+                    {
+                        case "socks5h":
+                            return ProxyType.SOCKS5H;
+                        case "http":
+                            return ProxyType.HTTP;
+                        case "socks5":
+                        default:
+                            return ProxyType.SOCKS5;
+                    }
+                }
+            }
 
             /// <summary>
             /// Gets the supported protocols as an enum value.

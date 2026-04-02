@@ -231,6 +231,65 @@ IntPtr Socksifier::Socksifier::AddSocks5Proxy(String^ endpoint, String^ username
 }
 
 /// <summary>
+/// Adds a proxy to the gateway with the specified proxy type.
+/// </summary>
+/// <param name="endpoint">The proxy endpoint (IP:Port).</param>
+/// <param name="username">The username for authentication.</param>
+/// <param name="password">The password for authentication.</param>
+/// <param name="proxyType">The proxy protocol type (SOCKS5, SOCKS5H, HTTP).</param>
+/// <param name="protocols">The supported protocols.</param>
+/// <param name="start">Whether to start the proxy immediately.</param>
+/// <returns>A handle to the proxy instance, or -1 on failure.</returns>
+IntPtr Socksifier::Socksifier::AddProxy(String^ endpoint, String^ username, String^ password,
+    ProxyType proxyType, SupportedProtocolsEnum protocols, const bool start)
+{
+    if (!unmanaged_ptr_)
+        return static_cast<IntPtr>(-1);
+
+    auto type_mx = proxy_type_mx::socks5;
+    switch (proxyType)
+    {
+    case ProxyType::SOCKS5:
+        type_mx = proxy_type_mx::socks5;
+        break;
+    case ProxyType::SOCKS5H:
+        type_mx = proxy_type_mx::socks5h;
+        break;
+    case ProxyType::HTTP:
+        type_mx = proxy_type_mx::http;
+        break;
+    }
+
+    auto protocols_mx = supported_protocols_mx::both;
+    switch (protocols)
+    {
+    case SupportedProtocolsEnum::TCP:
+        protocols_mx = supported_protocols_mx::tcp;
+        break;
+    case SupportedProtocolsEnum::UDP:
+        protocols_mx = supported_protocols_mx::udp;
+        break;
+    default:
+        break;
+    }
+
+    if (username != nullptr && password != nullptr)
+    {
+        return static_cast<IntPtr>(unmanaged_ptr_->add_proxy(
+            msclr::interop::marshal_as<std::string>(endpoint),
+            type_mx,
+            protocols_mx,
+            start,
+            msclr::interop::marshal_as<std::string>(username),
+            msclr::interop::marshal_as<std::string>(password)
+        ));
+    }
+
+    return static_cast<IntPtr>(unmanaged_ptr_->add_proxy(
+        msclr::interop::marshal_as<std::string>(endpoint), type_mx, protocols_mx, start));
+}
+
+/// <summary>
 /// Associates a process name with a specific proxy instance.
 /// </summary>
 /// <param name="processName">The process name to associate.</param>
