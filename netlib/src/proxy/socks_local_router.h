@@ -1,4 +1,6 @@
 #pragma once
+#include <cctype>
+#include <fstream>
 namespace proxy
 {
     /**
@@ -116,6 +118,8 @@ namespace proxy
         struct dns_query_value
         {
             unsigned long process_id{};
+            bool allow_shared_lookup{ false };
+            std::wstring process_identity;
             std::string hostname;
             std::chrono::steady_clock::time_point created_at{ std::chrono::steady_clock::now() };
         };
@@ -135,12 +139,45 @@ namespace proxy
         };
 
         /**
+         * @brief Key for mapping a resolved IP back to a hostname for a specific process identity.
+         */
+        struct dns_process_resolution_key
+        {
+            std::wstring process_identity;
+            net::ip_address_v4 resolved_ip;
+
+            bool operator<(const dns_process_resolution_key& other) const noexcept
+            {
+                return std::tie(process_identity, resolved_ip) < std::tie(other.process_identity, other.resolved_ip);
+            }
+        };
+
+        /**
          * @brief Cached DNS resolution data.
          */
         struct dns_resolution_value
         {
             std::string hostname;
             std::chrono::steady_clock::time_point expires_at{ std::chrono::steady_clock::now() };
+            bool ambiguous{ false };
+        };
+
+        /**
+         * @brief Tracks the host-order bounds for a fake IP allocation pool.
+         */
+        struct fake_ip_pool_range
+        {
+            uint32_t start_host_order{};
+            uint32_t end_host_order{};
+            uint32_t next_host_order{};
+        };
+
+        /**
+         * @brief Stores the assigned fake IP for a hostname.
+         */
+        struct fake_ip_assignment
+        {
+            net::ip_address_v4 address;
         };
 
         /**
@@ -177,6 +214,41 @@ namespace proxy
          * @brief Resolved DNS names keyed by process and destination IP.
          */
         std::map<dns_resolution_key, dns_resolution_value> resolved_dns_names_;
+
+        /**
+         * @brief Resolved DNS names keyed by process identity and destination IP.
+         */
+        std::map<dns_process_resolution_key, dns_resolution_value> process_resolved_dns_names_;
+
+        /**
+         * @brief Shared DNS resolutions for system-owned lookups such as Dnscache.
+         */
+        std::map<net::ip_address_v4, dns_resolution_value> shared_resolved_dns_names_;
+
+        /**
+         * @brief Imported IP-to-hostname mappings loaded from dns/fakeip configuration.
+         */
+        std::map<net::ip_address_v4, dns_resolution_value> imported_dns_names_;
+
+        /**
+         * @brief Imported fake IP ranges used for diagnostics and hostname recovery.
+         */
+        std::vector<net::ip_subnet<net::ip_address_v4>> fake_ip_ranges_;
+
+        /**
+         * @brief Internal fake IP hostname mappings allocated by the DNS hijack path.
+         */
+        std::map<net::ip_address_v4, dns_resolution_value> fake_ip_dns_names_;
+
+        /**
+         * @brief Internal hostname-to-fake-IP allocations.
+         */
+        std::unordered_map<std::string, fake_ip_assignment> fake_ip_allocations_by_hostname_;
+
+        /**
+         * @brief Allocator ranges for fake IP assignment in host byte order.
+         */
+        std::vector<fake_ip_pool_range> fake_ip_pool_ranges_;
 
         /**
          * @brief I/O completion port for asynchronous operations.
@@ -295,8 +367,104 @@ namespace proxy
         */
         std::atomic_bool is_active_{ false };
 
+        /**
+         * @brief Indicates whether DNS hijack is enabled.
+         */
+        bool dns_hijack_enabled_{ false };
+
+        /**
+         * @brief Indicates whether fake IP allocation is enabled.
+         */
+        bool fake_ip_enabled_{ false };
+
         static constexpr auto dns_pending_ttl_ = std::chrono::seconds(30);
         static constexpr auto dns_min_resolution_ttl_ = std::chrono::seconds(5);
+
+        static std::string normalize_dns_hostname(std::string hostname)
+        {
+            while (!hostname.empty() && hostname.back() == '.')
+            {
+                hostname.pop_back();
+            }
+
+            for (auto& ch : hostname)
+            {
+                ch = static_cast<char>(std::tolower(static_cast<unsigned char>(ch)));
+            }
+
+            return hostname;
+        }
+
+        static bool parse_bool_env_var(const char* const name) noexcept
+        {
+            char value[16]{};
+            const auto length = ::GetEnvironmentVariableA(name, value, static_cast<DWORD>(std::size(value)));
+
+            if (length == 0 || length >= std::size(value))
+            {
+                return false;
+            }
+
+            std::string normalized(value, length);
+            for (auto& ch : normalized)
+            {
+                ch = static_cast<char>(std::tolower(static_cast<unsigned char>(ch)));
+            }
+
+            return normalized == "1" || normalized == "true" || normalized == "yes" || normalized == "on";
+        }
+
+        static net::ip_address_v4 make_ip_address_from_host_order(const uint32_t value) noexcept
+        {
+            return net::ip_address_v4(htonl(value));
+        }
+
+        static std::optional<fake_ip_pool_range> parse_fake_ip_pool_range(const std::string& cidr)
+        {
+            const auto slash_pos = cidr.find('/');
+            if (slash_pos == std::string::npos)
+            {
+                return std::nullopt;
+            }
+
+            const auto [parsed, address] = net::ip_address_v4::from_string(cidr.substr(0, slash_pos));
+            if (!parsed)
+            {
+                return std::nullopt;
+            }
+
+            uint32_t prefix_length = 0;
+
+            try
+            {
+                prefix_length = static_cast<uint32_t>(std::stoul(cidr.substr(slash_pos + 1)));
+            }
+            catch (...)
+            {
+                return std::nullopt;
+            }
+
+            if (prefix_length > 32)
+            {
+                return std::nullopt;
+            }
+
+            const auto host_order_address = ntohl(address.S_un.S_addr);
+            const auto mask = prefix_length == 0
+                ? 0U
+                : 0xFFFFFFFFU << (32U - prefix_length);
+            const auto network = host_order_address & mask;
+            const auto broadcast = network | (~mask);
+            const auto start = prefix_length >= 31 ? network : network + 1;
+            const auto end = prefix_length >= 31 ? broadcast : broadcast - 1;
+
+            if (start > end)
+            {
+                return std::nullopt;
+            }
+
+            return fake_ip_pool_range{ start, end, start };
+        }
 
         void purge_dns_cache_entries_locked()
         {
@@ -325,6 +493,555 @@ namespace proxy
                     ++it;
                 }
             }
+
+            for (auto it = process_resolved_dns_names_.begin(); it != process_resolved_dns_names_.end();)
+            {
+                if (it->second.expires_at <= now)
+                {
+                    it = process_resolved_dns_names_.erase(it);
+                }
+                else
+                {
+                    ++it;
+                }
+            }
+
+            for (auto it = shared_resolved_dns_names_.begin(); it != shared_resolved_dns_names_.end();)
+            {
+                if (it->second.expires_at <= now)
+                {
+                    it = shared_resolved_dns_names_.erase(it);
+                }
+                else
+                {
+                    ++it;
+                }
+            }
+        }
+
+        static bool should_allow_shared_dns_lookup(const iphelper::network_process& process)
+        {
+            return process.id == 0 || process.name == L"SYSTEM" || process.name == L"DNSCACHE";
+        }
+
+        static std::wstring get_process_identity_for_dns_lookup(const iphelper::network_process& process)
+        {
+            if (!process.device_path_name.empty())
+            {
+                return process.device_path_name;
+            }
+
+            if (!process.path_name.empty())
+            {
+                return process.path_name;
+            }
+
+            return process.name;
+        }
+
+        void cache_hostname_resolution_locked(std::map<net::ip_address_v4, dns_resolution_value>& cache,
+                                             const net::ip_address_v4& resolved_ip,
+                                             const std::string& hostname,
+                                             const std::chrono::steady_clock::time_point expires_at)
+        {
+            if (hostname.empty())
+            {
+                return;
+            }
+
+            const auto it = cache.find(resolved_ip);
+            if (it == cache.end())
+            {
+                cache.emplace(resolved_ip, dns_resolution_value{ hostname, expires_at, false });
+                return;
+            }
+
+            it->second.expires_at = expires_at > it->second.expires_at ? expires_at : it->second.expires_at;
+
+            if (it->second.hostname.empty() || it->second.hostname == hostname)
+            {
+                it->second.hostname = hostname;
+                return;
+            }
+
+            it->second.hostname.clear();
+            it->second.ambiguous = true;
+        }
+
+        void cache_shared_dns_resolution_locked(const net::ip_address_v4& resolved_ip,
+                                                const std::string& hostname,
+                                                const std::chrono::steady_clock::time_point expires_at)
+        {
+            cache_hostname_resolution_locked(shared_resolved_dns_names_, resolved_ip, hostname, expires_at);
+        }
+
+        void cache_imported_dns_resolution_locked(const net::ip_address_v4& resolved_ip,
+                                                  const std::string& hostname)
+        {
+            cache_hostname_resolution_locked(imported_dns_names_, resolved_ip, hostname,
+                std::chrono::steady_clock::time_point::max());
+        }
+
+        [[nodiscard]] bool is_fake_ip_range_locked(const net::ip_address_v4& destination_ip) const noexcept
+        {
+            for (const auto& subnet : fake_ip_ranges_)
+            {
+                if (subnet.address_in_subnet(destination_ip))
+                {
+                    return true;
+                }
+            }
+
+            return false;
+        }
+
+        void load_imported_hostname_mappings()
+        {
+            constexpr auto import_env_var = "PROXIFYRE_HOST_MAPPING_FILE";
+            char mapping_file_path[MAX_PATH]{};
+            const auto path_length = ::GetEnvironmentVariableA(import_env_var, mapping_file_path, MAX_PATH);
+
+            if (path_length == 0 || path_length >= MAX_PATH)
+            {
+                return;
+            }
+
+            std::ifstream mapping_file(mapping_file_path);
+            if (!mapping_file.is_open())
+            {
+                NETLIB_LOG(log_level::warning, "Failed to open imported hostname mapping file {}", mapping_file_path);
+                return;
+            }
+
+            size_t imported_host_count = 0;
+            size_t imported_fake_range_count = 0;
+            std::string line;
+
+            std::scoped_lock lock(dns_cache_lock_);
+
+            while (std::getline(mapping_file, line))
+            {
+                if (line.empty())
+                {
+                    continue;
+                }
+
+                std::vector<std::string> fields;
+                size_t offset = 0;
+
+                while (offset <= line.size())
+                {
+                    const auto next = line.find('\t', offset);
+                    if (next == std::string::npos)
+                    {
+                        fields.push_back(line.substr(offset));
+                        break;
+                    }
+
+                    fields.push_back(line.substr(offset, next - offset));
+                    offset = next + 1;
+                }
+
+                if (fields.empty())
+                {
+                    continue;
+                }
+
+                if ((fields[0] == "dns" || fields[0] == "fakeip") && fields.size() >= 3)
+                {
+                    if (const auto [parsed, address] = net::ip_address_v4::from_string(fields[1]); parsed)
+                    {
+                        cache_imported_dns_resolution_locked(address, fields[2]);
+                        ++imported_host_count;
+                    }
+                    else
+                    {
+                        NETLIB_LOG(log_level::warning,
+                                   "Ignoring imported hostname mapping with invalid IPv4 address {}",
+                                   fields[1]);
+                    }
+                }
+                else if (fields[0] == "fakeip-range" && fields.size() >= 2)
+                {
+                    if (const auto subnet = net::ip_subnet<net::ip_address_v4>::from_cidr(fields[1]); subnet.has_value())
+                    {
+                        fake_ip_ranges_.push_back(subnet.value());
+                        ++imported_fake_range_count;
+                    }
+                    else
+                    {
+                        NETLIB_LOG(log_level::warning,
+                                   "Ignoring imported fake IP range with invalid CIDR {}",
+                                   fields[1]);
+                    }
+                }
+            }
+
+            if (imported_host_count != 0 || imported_fake_range_count != 0)
+            {
+                NETLIB_LOG(log_level::info,
+                           "Imported {} hostname mappings and {} fake IP ranges from {}",
+                           imported_host_count,
+                           imported_fake_range_count,
+                           mapping_file_path);
+            }
+        }
+
+        void load_dns_hijack_configuration()
+        {
+            constexpr auto dns_hijack_env_var = "PROXIFYRE_DNS_HIJACK";
+            constexpr auto fake_ip_enabled_env_var = "PROXIFYRE_FAKEIP_ENABLED";
+            constexpr auto fake_ip_ranges_env_var = "PROXIFYRE_FAKEIP_RANGES";
+
+            dns_hijack_enabled_ = parse_bool_env_var(dns_hijack_env_var);
+            fake_ip_enabled_ = parse_bool_env_var(fake_ip_enabled_env_var);
+
+            char fake_ip_ranges[4096]{};
+            const auto length = ::GetEnvironmentVariableA(
+                fake_ip_ranges_env_var,
+                fake_ip_ranges,
+                static_cast<DWORD>(std::size(fake_ip_ranges)));
+
+            std::scoped_lock lock(dns_cache_lock_);
+            fake_ip_ranges_.clear();
+            fake_ip_pool_ranges_.clear();
+
+            if (length != 0 && length < std::size(fake_ip_ranges))
+            {
+                size_t offset = 0;
+
+                while (offset <= length)
+                {
+                    const auto next_delimiter = std::string_view(fake_ip_ranges, length).find(';', offset);
+                    const auto token = next_delimiter == std::string_view::npos
+                        ? std::string(fake_ip_ranges + offset, length - offset)
+                        : std::string(fake_ip_ranges + offset, next_delimiter - offset);
+
+                    if (!token.empty())
+                    {
+                        if (const auto subnet = net::ip_subnet<net::ip_address_v4>::from_cidr(token); subnet.has_value())
+                        {
+                            fake_ip_ranges_.push_back(subnet.value());
+                        }
+
+                        if (const auto pool_range = parse_fake_ip_pool_range(token); pool_range.has_value())
+                        {
+                            fake_ip_pool_ranges_.push_back(pool_range.value());
+                        }
+                        else
+                        {
+                            NETLIB_LOG(log_level::warning,
+                                "Ignoring fake IP range with invalid CIDR {}",
+                                token);
+                        }
+                    }
+
+                    if (next_delimiter == std::string_view::npos)
+                    {
+                        break;
+                    }
+
+                    offset = next_delimiter + 1;
+                }
+            }
+
+            if (dns_hijack_enabled_)
+            {
+                NETLIB_LOG(log_level::info, "DNS hijack is enabled.");
+            }
+
+            if (fake_ip_enabled_)
+            {
+                NETLIB_LOG(log_level::info,
+                    "Fake IP is enabled with {} allocation range(s).",
+                    fake_ip_pool_ranges_.size());
+            }
+        }
+
+        std::optional<net::ip_address_v4> allocate_fake_ip_locked(const std::string& hostname)
+        {
+            if (hostname.empty() || !fake_ip_enabled_)
+            {
+                return std::nullopt;
+            }
+
+            if (const auto it = fake_ip_allocations_by_hostname_.find(hostname);
+                it != fake_ip_allocations_by_hostname_.end())
+            {
+                return it->second.address;
+            }
+
+            for (auto& range : fake_ip_pool_ranges_)
+            {
+                if (range.start_host_order > range.end_host_order)
+                {
+                    continue;
+                }
+
+                auto candidate = range.next_host_order;
+                if (candidate < range.start_host_order || candidate > range.end_host_order)
+                {
+                    candidate = range.start_host_order;
+                }
+
+                const auto first_candidate = candidate;
+                bool first_iteration = true;
+
+                while (first_iteration || candidate != first_candidate)
+                {
+                    first_iteration = false;
+
+                    const auto fake_ip = make_ip_address_from_host_order(candidate);
+                    if (fake_ip_dns_names_.find(fake_ip) == fake_ip_dns_names_.end())
+                    {
+                        fake_ip_dns_names_[fake_ip] =
+                            dns_resolution_value{ hostname, std::chrono::steady_clock::time_point::max(), false };
+                        fake_ip_allocations_by_hostname_[hostname] = fake_ip_assignment{ fake_ip };
+                        range.next_host_order = candidate == range.end_host_order ? range.start_host_order : candidate + 1;
+                        return fake_ip;
+                    }
+
+                    candidate = candidate == range.end_host_order ? range.start_host_order : candidate + 1;
+                }
+            }
+
+            return std::nullopt;
+        }
+
+        bool should_hijack_dns_for_process(const std::shared_ptr<iphelper::network_process>& process)
+        {
+            if (!process || process->excluded)
+            {
+                return false;
+            }
+
+            if (process->tcp_proxy_port.has_value() || process->udp_proxy_port.has_value())
+            {
+                return true;
+            }
+
+            return get_proxy_port_tcp(process).has_value() || get_proxy_port_udp(process).has_value();
+        }
+
+        bool try_hijack_dns_query(ndisapi::intermediate_buffer& buffer,
+                                  iphdr* const ip_header,
+                                  udphdr* const udp_header,
+                                  const std::shared_ptr<iphelper::network_process>& process,
+                                  const size_t payload_size)
+        {
+            if (!dns_hijack_enabled_ || !fake_ip_enabled_ || !should_hijack_dns_for_process(process))
+            {
+                return false;
+            }
+
+            auto* const ethernet_header = reinterpret_cast<ether_header_ptr>(buffer.m_IBuffer);
+            auto* const dns_payload = reinterpret_cast<uint8_t*>(udp_header + 1);
+
+            if (payload_size < sizeof(dns_header))
+            {
+                return false;
+            }
+
+            auto* const header = reinterpret_cast<dns_header*>(dns_payload);
+            if ((ntohs(header->flags) & 0x8000U) != 0 || ntohs(header->qdcount) != 1)
+            {
+                return false;
+            }
+
+            auto offset = sizeof(dns_header);
+            std::string hostname;
+
+            if (!parse_dns_name(dns_payload, payload_size, offset, hostname))
+            {
+                return false;
+            }
+
+            hostname = normalize_dns_hostname(std::move(hostname));
+            if (hostname.empty() || offset + sizeof(qr_record) > payload_size)
+            {
+                return false;
+            }
+
+            const auto* const question = reinterpret_cast<const qr_record*>(dns_payload + offset);
+            const auto question_type = ntohs(question->type);
+            const auto question_class = ntohs(question->clas);
+            const auto question_end = offset + sizeof(qr_record);
+            auto response_size = question_end;
+            std::optional<net::ip_address_v4> fake_ip = std::nullopt;
+
+            header->flags = htons(0x8000U | 0x0080U | (ntohs(header->flags) & 0x0100U));
+            header->nscount = 0;
+            header->arcount = 0;
+            header->ancount = 0;
+
+            if (question_class == 1 && question_type == 1)
+            {
+                std::scoped_lock lock(dns_cache_lock_);
+                purge_dns_cache_entries_locked();
+                fake_ip = allocate_fake_ip_locked(hostname);
+
+                if (!fake_ip.has_value())
+                {
+                    return false;
+                }
+
+                const uint16_t answer_name = htons(0xC00CU);
+                const res_record answer{
+                    htons(1),
+                    htons(1),
+                    htonl(static_cast<uint32_t>(dns_min_resolution_ttl_.count())),
+                    htons(sizeof(IN_ADDR))
+                };
+
+                memcpy(dns_payload + response_size, &answer_name, sizeof(answer_name));
+                response_size += sizeof(answer_name);
+                memcpy(dns_payload + response_size, &answer, sizeof(answer));
+                response_size += sizeof(answer);
+                memcpy(dns_payload + response_size, &fake_ip->S_un.S_addr, sizeof(IN_ADDR));
+                response_size += sizeof(IN_ADDR);
+                header->ancount = htons(1);
+            }
+
+            std::swap(ethernet_header->h_dest, ethernet_header->h_source);
+            std::swap(ip_header->ip_dst, ip_header->ip_src);
+            std::swap(udp_header->th_dport, udp_header->th_sport);
+
+            udp_header->length = htons(static_cast<uint16_t>(sizeof(udphdr) + response_size));
+            ip_header->ip_len = htons(static_cast<uint16_t>(sizeof(DWORD) * ip_header->ip_hl + sizeof(udphdr) + response_size));
+            buffer.m_Length = static_cast<DWORD>(
+                ETHER_HEADER_LENGTH + sizeof(DWORD) * ip_header->ip_hl + sizeof(udphdr) + response_size);
+
+            CNdisApi::RecalculateUDPChecksum(&buffer);
+            CNdisApi::RecalculateIPChecksum(&buffer);
+
+            if (fake_ip.has_value())
+            {
+                NETLIB_LOG(log_level::info,
+                    "Hijacked DNS query for pid {} host {} -> fake IP {}",
+                    process ? process->id : 0,
+                    hostname,
+                    fake_ip.value());
+            }
+            else
+            {
+                NETLIB_LOG(log_level::info,
+                    "Hijacked DNS query for pid {} host {} with empty response for qtype {}",
+                    process ? process->id : 0,
+                    hostname,
+                    question_type);
+            }
+
+            return true;
+        }
+
+        bool try_hijack_dns_query_ipv6(ndisapi::intermediate_buffer& buffer,
+                                       ipv6hdr* const ip_header,
+                                       udphdr* const udp_header,
+                                       const std::shared_ptr<iphelper::network_process>& process,
+                                       const size_t payload_size)
+        {
+            if (!dns_hijack_enabled_ || !fake_ip_enabled_ || !should_hijack_dns_for_process(process))
+            {
+                return false;
+            }
+
+            auto* const ethernet_header = reinterpret_cast<ether_header_ptr>(buffer.m_IBuffer);
+            auto* const dns_payload = reinterpret_cast<uint8_t*>(udp_header + 1);
+
+            if (payload_size < sizeof(dns_header))
+            {
+                return false;
+            }
+
+            auto* const header = reinterpret_cast<dns_header*>(dns_payload);
+            if ((ntohs(header->flags) & 0x8000U) != 0 || ntohs(header->qdcount) != 1)
+            {
+                return false;
+            }
+
+            auto offset = sizeof(dns_header);
+            std::string hostname;
+
+            if (!parse_dns_name(dns_payload, payload_size, offset, hostname))
+            {
+                return false;
+            }
+
+            hostname = normalize_dns_hostname(std::move(hostname));
+            if (hostname.empty() || offset + sizeof(qr_record) > payload_size)
+            {
+                return false;
+            }
+
+            const auto* const question = reinterpret_cast<const qr_record*>(dns_payload + offset);
+            const auto question_type = ntohs(question->type);
+            const auto question_class = ntohs(question->clas);
+            const auto question_end = offset + sizeof(qr_record);
+            auto response_size = question_end;
+            std::optional<net::ip_address_v4> fake_ip = std::nullopt;
+
+            header->flags = htons(0x8000U | 0x0080U | (ntohs(header->flags) & 0x0100U));
+            header->nscount = 0;
+            header->arcount = 0;
+            header->ancount = 0;
+
+            if (question_class == 1 && question_type == 1)
+            {
+                std::scoped_lock lock(dns_cache_lock_);
+                purge_dns_cache_entries_locked();
+                fake_ip = allocate_fake_ip_locked(hostname);
+
+                if (!fake_ip.has_value())
+                {
+                    return false;
+                }
+
+                const uint16_t answer_name = htons(0xC00CU);
+                const res_record answer{
+                    htons(1),
+                    htons(1),
+                    htonl(static_cast<uint32_t>(dns_min_resolution_ttl_.count())),
+                    htons(sizeof(IN_ADDR))
+                };
+
+                memcpy(dns_payload + response_size, &answer_name, sizeof(answer_name));
+                response_size += sizeof(answer_name);
+                memcpy(dns_payload + response_size, &answer, sizeof(answer));
+                response_size += sizeof(answer);
+                memcpy(dns_payload + response_size, &fake_ip->S_un.S_addr, sizeof(IN_ADDR));
+                response_size += sizeof(IN_ADDR);
+                header->ancount = htons(1);
+            }
+
+            std::swap(ethernet_header->h_dest, ethernet_header->h_source);
+            std::swap(ip_header->ip6_dst, ip_header->ip6_src);
+            std::swap(udp_header->th_dport, udp_header->th_sport);
+
+            udp_header->length = htons(static_cast<uint16_t>(sizeof(udphdr) + response_size));
+            ip_header->ip6_len = htons(static_cast<uint16_t>(sizeof(udphdr) + response_size));
+            buffer.m_Length = static_cast<DWORD>(
+                ETHER_HEADER_LENGTH + sizeof(ipv6hdr) + sizeof(udphdr) + response_size);
+
+            net::ipv6_helper::recalculate_tcp_udp_checksum(&buffer);
+
+            if (fake_ip.has_value())
+            {
+                NETLIB_LOG(log_level::info,
+                    "Hijacked IPv6 DNS query for pid {} host {} -> fake IP {}",
+                    process ? process->id : 0,
+                    hostname,
+                    fake_ip.value());
+            }
+            else
+            {
+                NETLIB_LOG(log_level::info,
+                    "Hijacked IPv6 DNS query for pid {} host {} with empty response for qtype {}",
+                    process ? process->id : 0,
+                    hostname,
+                    question_type);
+            }
+
+            return true;
         }
 
         bool parse_dns_name(const uint8_t* const dns_payload, const size_t payload_size,
@@ -410,8 +1127,10 @@ namespace proxy
             return false;
         }
 
-        void cache_dns_query(const iphdr* const ip_header, const udphdr* const udp_header, const unsigned long process_id,
-                             const uint8_t* const dns_payload, const size_t payload_size)
+        void cache_dns_query(const iphdr* const ip_header, const udphdr* const udp_header,
+                     const iphelper::network_process& process, const bool allow_shared_lookup,
+                     const uint8_t* const dns_payload,
+                             const size_t payload_size)
         {
             if (payload_size < sizeof(dns_header))
             {
@@ -433,6 +1152,12 @@ namespace proxy
                 return;
             }
 
+            hostname = normalize_dns_hostname(std::move(hostname));
+            if (hostname.empty())
+            {
+                return;
+            }
+
             if (offset + sizeof(qr_record) > payload_size)
             {
                 return;
@@ -446,7 +1171,25 @@ namespace proxy
                 ntohs(udp_header->th_sport),
                 net::ip_address_v4(ip_header->ip_dst),
                 ntohs(header->id)
-            }] = dns_query_value{ process_id, hostname, std::chrono::steady_clock::now() };
+            }] = dns_query_value{
+                process.id,
+                allow_shared_lookup,
+                get_process_identity_for_dns_lookup(process),
+                hostname,
+                std::chrono::steady_clock::now()
+            };
+
+            NETLIB_LOG(log_level::debug,
+                "Cached DNS query for pid {} identity {} host {} shared={} txid={} via {}:{} -> {}:{}",
+                process.id,
+                tools::strings::to_string(get_process_identity_for_dns_lookup(process)),
+                hostname,
+                allow_shared_lookup,
+                ntohs(header->id),
+                net::ip_address_v4(ip_header->ip_src),
+                ntohs(udp_header->th_sport),
+                net::ip_address_v4(ip_header->ip_dst),
+                ntohs(udp_header->th_dport));
         }
 
         void cache_dns_response(const iphdr* const ip_header, const udphdr* const udp_header,
@@ -478,6 +1221,13 @@ namespace proxy
 
             if (query_it == pending_dns_queries_.end())
             {
+                NETLIB_LOG(log_level::debug,
+                    "DNS response had no pending query match for txid={} via {}:{} -> {}:{}",
+                    ntohs(header->id),
+                    net::ip_address_v4(ip_header->ip_src),
+                    ntohs(udp_header->th_sport),
+                    net::ip_address_v4(ip_header->ip_dst),
+                    ntohs(udp_header->th_dport));
                 return;
             }
 
@@ -498,8 +1248,10 @@ namespace proxy
             }
 
             const auto now = std::chrono::steady_clock::now();
-            const auto hostname = query_it->second.hostname;
+            const auto hostname = normalize_dns_hostname(query_it->second.hostname);
             const auto process_id = query_it->second.process_id;
+            const auto allow_shared_lookup = query_it->second.allow_shared_lookup;
+            const auto process_identity = query_it->second.process_identity;
 
             for (size_t answer_index = 0; answer_index < ntohs(header->ancount); ++answer_index)
             {
@@ -532,8 +1284,30 @@ namespace proxy
                         ttl = dns_min_resolution_ttl_;
                     }
 
-                    resolved_dns_names_[dns_resolution_key{ process_id, net::ip_address_v4(resolved_address) }] =
-                        dns_resolution_value{ hostname, now + ttl };
+                    const auto resolved_ip = net::ip_address_v4(resolved_address);
+                    const auto expires_at = now + ttl;
+
+                    resolved_dns_names_[dns_resolution_key{ process_id, resolved_ip }] =
+                        dns_resolution_value{ hostname, expires_at, false };
+
+                    if (!process_identity.empty())
+                    {
+                        process_resolved_dns_names_[dns_process_resolution_key{ process_identity, resolved_ip }] =
+                            dns_resolution_value{ hostname, expires_at, false };
+                    }
+
+                    if (allow_shared_lookup)
+                    {
+                        cache_shared_dns_resolution_locked(resolved_ip, hostname, expires_at);
+                    }
+
+                    NETLIB_LOG(log_level::debug,
+                        "Cached DNS response hostname {} -> {} for pid {} identity {} shared={}",
+                        hostname,
+                        resolved_ip,
+                        process_id,
+                        tools::strings::to_string(process_identity),
+                        allow_shared_lookup);
                 }
 
                 offset += rdlength;
@@ -542,17 +1316,84 @@ namespace proxy
             pending_dns_queries_.erase(query_it);
         }
 
-        std::optional<std::string> lookup_dns_hostname(const unsigned long process_id,
+        std::optional<std::string> lookup_dns_hostname(const iphelper::network_process& process,
                                                        const net::ip_address_v4& destination_ip)
         {
             std::scoped_lock lock(dns_cache_lock_);
             purge_dns_cache_entries_locked();
 
-            if (const auto it = resolved_dns_names_.find(dns_resolution_key{ process_id, destination_ip });
+            if (const auto it = resolved_dns_names_.find(dns_resolution_key{ process.id, destination_ip });
                 it != resolved_dns_names_.end())
             {
+                NETLIB_LOG(log_level::debug,
+                    "Using exact DNS hostname match for pid {} destination {} -> {}",
+                    process.id,
+                    destination_ip,
+                    it->second.hostname);
                 return it->second.hostname;
             }
+
+            const auto process_identity = get_process_identity_for_dns_lookup(process);
+            if (!process_identity.empty())
+            {
+                if (const auto it = process_resolved_dns_names_.find(dns_process_resolution_key{ process_identity, destination_ip });
+                    it != process_resolved_dns_names_.end())
+                {
+                    NETLIB_LOG(log_level::debug,
+                        "Using process identity DNS hostname fallback for pid {} identity {} destination {} -> {}",
+                        process.id,
+                        tools::strings::to_string(process_identity),
+                        destination_ip,
+                        it->second.hostname);
+                    return it->second.hostname;
+                }
+            }
+
+            if (const auto it = fake_ip_dns_names_.find(destination_ip);
+                it != fake_ip_dns_names_.end() && !it->second.hostname.empty())
+            {
+                NETLIB_LOG(log_level::info,
+                    "Using fake IP hostname for pid {} and destination {} -> {}",
+                    process.id,
+                    destination_ip,
+                    it->second.hostname);
+                return it->second.hostname;
+            }
+
+            if (const auto it = imported_dns_names_.find(destination_ip);
+                it != imported_dns_names_.end() && !it->second.ambiguous && !it->second.hostname.empty())
+            {
+                NETLIB_LOG(log_level::debug,
+                    "Using imported DNS/fakeip hostname for pid {} and destination {} -> {}",
+                    process.id,
+                    destination_ip,
+                    it->second.hostname);
+                return it->second.hostname;
+            }
+
+            if (const auto it = shared_resolved_dns_names_.find(destination_ip);
+                it != shared_resolved_dns_names_.end() && !it->second.ambiguous && !it->second.hostname.empty())
+            {
+                NETLIB_LOG(log_level::debug,
+                    "Using shared DNS hostname fallback for pid {} and destination {} -> {}",
+                    process.id, destination_ip, it->second.hostname);
+                return it->second.hostname;
+            }
+
+            if (is_fake_ip_range_locked(destination_ip))
+            {
+                NETLIB_LOG(log_level::debug,
+                    "No fake IP hostname match for pid {} identity {} destination {}",
+                    process.id,
+                    tools::strings::to_string(process_identity),
+                    destination_ip);
+            }
+
+            NETLIB_LOG(log_level::debug,
+                "No DNS hostname match for pid {} identity {} destination {}",
+                process.id,
+                tools::strings::to_string(process_identity),
+                destination_ip);
 
             return std::nullopt;
         }
@@ -586,9 +1427,11 @@ namespace proxy
         {
             using namespace std::string_literals;
 
-            if (pcap_log_stream) {
+            if (pcap_log_stream_) {
                 pcap_logger_.emplace(*pcap_log_stream_);
             }
+
+            load_dns_hijack_configuration();
 
             // Initialize TCP and UDP redirect objects
             tcp_redirect_ = std::make_unique<ndisapi::tcp_local_redirect<net::ip_address_v4>>(log_level_, log_stream);
@@ -602,52 +1445,79 @@ namespace proxy
                 {
                     auto* const ethernet_header = reinterpret_cast<ether_header_ptr>(buffer.m_IBuffer);
                     const auto destination_mac = net::mac_address(ethernet_header->h_dest);
-
-                    if (ntohs(ethernet_header->h_proto) != ETH_P_IP)
-                    {
-                        return packet_filter::packet_action{ packet_filter::packet_action::action_type::pass };
-                    }
+                    const auto ether_type = ntohs(ethernet_header->h_proto);
 
                     log_packet_to_pcap(buffer);
 
-                    const auto* const ip_header = reinterpret_cast<iphdr_ptr>(ethernet_header + 1);
-
-                    if (ip_header->ip_p == IPPROTO_UDP)
+                    if (ether_type == ETH_P_IP)
                     {
-                        // skip broadcast and multicast UDP packets
-                        if (destination_mac.is_broadcast() || destination_mac.is_multicast())
+                        const auto* const ip_header = reinterpret_cast<iphdr_ptr>(ethernet_header + 1);
+
+                        if (ip_header->ip_p == IPPROTO_UDP)
+                        {
+                            // skip broadcast and multicast UDP packets
+                            if (destination_mac.is_broadcast() || destination_mac.is_multicast())
+                            {
+                                return packet_filter::packet_action{ packet_filter::packet_action::action_type::pass };
+                            }
+
+                            if (const auto result = process_udp_packet(buffer, false))
+                            {
+                                return result.value();
+                            }
+                            // Queue for the later processing
+                            if (auto allocated_buffer = ndisapi::intermediate_buffer_pool::instance().allocate(buffer))
+                            {
+                                {
+                                    std::scoped_lock lock(process_resolve_buffer_mutex_);
+                                    process_resolve_buffer_queue_.push(std::move(allocated_buffer));
+                                }
+                                process_resolve_buffer_queue_cv_.notify_one();
+                            }
+                            else
+                            {
+                                // Handle the error, e.g., log it or take corrective action
+                                NETLIB_LOG(log_level::error, "Failed to allocate buffer.");
+                            }
+                            return packet_filter::packet_action{ packet_filter::packet_action::action_type::drop };
+                        }
+
+                        if (ip_header->ip_p == IPPROTO_TCP)
+                        {
+                            if (const auto result = process_tcp_packet(buffer, false))
+                            {
+                                return result.value();
+                            }
+                            // Queue for the later processing
+                            if (auto allocated_buffer = ndisapi::intermediate_buffer_pool::instance().allocate(buffer))
+                            {
+                                {
+                                    std::scoped_lock lock(process_resolve_buffer_mutex_);
+                                    process_resolve_buffer_queue_.push(std::move(allocated_buffer));
+                                }
+                                process_resolve_buffer_queue_cv_.notify_one();
+                            }
+                            else
+                            {
+                                // Handle the error, e.g., log it or take corrective action
+                                NETLIB_LOG(log_level::error, "Failed to allocate buffer.");
+                            }
+                            return packet_filter::packet_action{ packet_filter::packet_action::action_type::drop };
+                        }
+                    }
+
+                    if (ether_type == ETH_P_IPV6)
+                    {
+                        if (destination_mac.is_multicast())
                         {
                             return packet_filter::packet_action{ packet_filter::packet_action::action_type::pass };
                         }
 
-                        if (const auto result = process_udp_packet(buffer, false))
+                        if (const auto result = process_udp_packet_v6(buffer, false))
                         {
                             return result.value();
                         }
-                        // Queue for the later processing
-                        if (auto allocated_buffer = ndisapi::intermediate_buffer_pool::instance().allocate(buffer))
-                        {
-                            {
-                                std::scoped_lock lock(process_resolve_buffer_mutex_);
-                                process_resolve_buffer_queue_.push(std::move(allocated_buffer));
-                            }
-                            process_resolve_buffer_queue_cv_.notify_one();
-                        }
-                        else
-                        {
-                            // Handle the error, e.g., log it or take corrective action
-                            NETLIB_LOG(log_level::error, "Failed to allocate buffer.");
-                        }
-                        return packet_filter::packet_action{ packet_filter::packet_action::action_type::drop };
-                    }
 
-                    if (ip_header->ip_p == IPPROTO_TCP)
-                    {
-                        if (const auto result = process_tcp_packet(buffer, false))
-                        {
-                            return result.value();
-                        }
-                        // Queue for the later processing
                         if (auto allocated_buffer = ndisapi::intermediate_buffer_pool::instance().allocate(buffer))
                         {
                             {
@@ -658,9 +1528,9 @@ namespace proxy
                         }
                         else
                         {
-                            // Handle the error, e.g., log it or take corrective action
-                            NETLIB_LOG(log_level::error, "Failed to allocate buffer.");
+                            NETLIB_LOG(log_level::error, "Failed to allocate IPv6 buffer.");
                         }
+
                         return packet_filter::packet_action{ packet_filter::packet_action::action_type::drop };
                     }
 
@@ -964,6 +1834,11 @@ namespace proxy
         void set_bypass_lan() noexcept
         {
             add_lan_passover_filters_v4();
+
+            if (dns_hijack_enabled_)
+            {
+                add_lan_dns_redirect_filters_v4();
+            }
         }
 
         /**
@@ -1594,7 +2469,7 @@ namespace proxy
         {
             auto* const ethernet_header = reinterpret_cast<ether_header_ptr>(buffer.m_IBuffer);
             auto* const ip_header = reinterpret_cast<iphdr_ptr>(ethernet_header + 1);
-            const auto* const udp_header = reinterpret_cast<udphdr_ptr>(reinterpret_cast<PUCHAR>(ip_header)
+            auto* const udp_header = reinterpret_cast<udphdr_ptr>(reinterpret_cast<PUCHAR>(ip_header)
                 + sizeof(DWORD) * ip_header->ip_hl);
             const auto* const dns_payload = reinterpret_cast<const uint8_t*>(udp_header + 1);
             const auto udp_payload_size = ntohs(udp_header->length) >= sizeof(udphdr)
@@ -1629,10 +2504,30 @@ namespace proxy
                         ip_header->ip_src, ntohs(udp_header->th_sport)
                     });
                 }
+                else if (!process)
+                {
+                    return std::nullopt;
+                }
 
                 if (process)
                 {
-                    cache_dns_query(ip_header, udp_header, process->id, dns_payload, udp_payload_size);
+                    if (try_hijack_dns_query(buffer, ip_header, udp_header, process, udp_payload_size))
+                    {
+                        log_packet_to_pcap(buffer);
+                        return packet_filter::packet_action{ packet_filter::packet_action::action_type::revert };
+                    }
+
+                    cache_dns_query(
+                        ip_header,
+                        udp_header,
+                        *process,
+                        should_allow_shared_dns_lookup(*process),
+                        dns_payload,
+                        udp_payload_size);
+                }
+                else if (postponed)
+                {
+                    return packet_filter::packet_action{ packet_filter::packet_action::action_type::pass };
                 }
 
                 return packet_filter::packet_action{ packet_filter::packet_action::action_type::pass };
@@ -1687,6 +2582,64 @@ namespace proxy
             else
             {
                 process->bypass_udp = true;
+            }
+
+            return packet_filter::packet_action{ packet_filter::packet_action::action_type::pass };
+        }
+
+        std::optional<packet_filter::packet_action> process_udp_packet_v6(ndisapi::intermediate_buffer& buffer, const bool postponed)
+        {
+            auto* const ethernet_header = reinterpret_cast<ether_header_ptr>(buffer.m_IBuffer);
+            auto* const ip_header = reinterpret_cast<ipv6hdr_ptr>(ethernet_header + 1);
+            auto [transport_header, protocol] = net::ipv6_helper::find_transport_header(
+                ip_header,
+                buffer.m_Length - ETHER_HEADER_LENGTH);
+
+            if (transport_header == nullptr || protocol != IPPROTO_UDP)
+            {
+                return packet_filter::packet_action{ packet_filter::packet_action::action_type::pass };
+            }
+
+            auto* const udp_header = static_cast<udphdr_ptr>(transport_header);
+            const auto* const dns_payload = reinterpret_cast<const uint8_t*>(udp_header + 1);
+            const auto udp_payload_size = ntohs(udp_header->length) >= sizeof(udphdr)
+                ? static_cast<size_t>(ntohs(udp_header->length) - sizeof(udphdr))
+                : 0U;
+
+            if (ntohs(udp_header->th_sport) == 53)
+            {
+                return packet_filter::packet_action{ packet_filter::packet_action::action_type::pass };
+            }
+
+            if (ntohs(udp_header->th_dport) == 53)
+            {
+                auto process = process_lookup_v6_.lookup_process_for_udp<false>(net::ip_endpoint<net::ip_address_v6>{
+                    ip_header->ip6_src, ntohs(udp_header->th_sport)
+                });
+
+                if (!process && postponed)
+                {
+                    process = process_lookup_v6_.lookup_process_for_udp<true>(net::ip_endpoint<net::ip_address_v6>{
+                        ip_header->ip6_src, ntohs(udp_header->th_sport)
+                    });
+                }
+                else if (!process)
+                {
+                    return std::nullopt;
+                }
+
+                if (process)
+                {
+                    if (try_hijack_dns_query_ipv6(buffer, ip_header, udp_header, process, udp_payload_size))
+                    {
+                        log_packet_to_pcap(buffer);
+                        return packet_filter::packet_action{ packet_filter::packet_action::action_type::revert };
+                    }
+                }
+                else if (postponed)
+                {
+                    return packet_filter::packet_action{ packet_filter::packet_action::action_type::pass };
+                }
             }
 
             return packet_filter::packet_action{ packet_filter::packet_action::action_type::pass };
@@ -1767,7 +2720,7 @@ namespace proxy
                 {
                     auto destination_info = tcp_destination_info{
                         net::ip_endpoint(net::ip_address_v4(ip_header->ip_dst), ntohs(tcp_header->th_dport)),
-                        lookup_dns_hostname(process->id, net::ip_address_v4(ip_header->ip_dst))
+                        lookup_dns_hostname(*process, net::ip_address_v4(ip_header->ip_dst))
                     };
 
                     std::scoped_lock lock(tcp_mapper_lock_);
@@ -1904,6 +2857,7 @@ namespace proxy
 
                 // Actualize process lookup before processing
                 process_lookup_v4_.actualize(true, true);
+                process_lookup_v6_.actualize(true, true);
 
                 while (!local_queue.empty())
                 {
@@ -1911,11 +2865,49 @@ namespace proxy
                     local_queue.pop();
 
                     auto* const ethernet_header = reinterpret_cast<ether_header_ptr>(buffer_ptr->m_IBuffer);
+                    const auto ether_type = ntohs(ethernet_header->h_proto);
 
-                    if (const auto* const ip_header = reinterpret_cast<iphdr_ptr>(ethernet_header + 1);
-                        ip_header->ip_p == IPPROTO_UDP)
+                    if (ether_type == ETH_P_IP)
                     {
-                        if (const auto result = process_udp_packet(*buffer_ptr, true);
+                        if (const auto* const ip_header = reinterpret_cast<iphdr_ptr>(ethernet_header + 1);
+                            ip_header->ip_p == IPPROTO_UDP)
+                        {
+                            if (const auto result = process_udp_packet(*buffer_ptr, true);
+                                result && result->action == packet_filter::packet_action::action_type::pass)
+                            {
+                                to_adapters.push_back(std::move(buffer_ptr));
+                            }
+                            else if (result && result->action == packet_filter::packet_action::action_type::revert)
+                            {
+                                to_mstcp.push_back(std::move(buffer_ptr));
+                            }
+                            else
+                            {
+                                // Should always have a result for postponed packets
+                                assert(false && "process_udp_packet should always return a result for postponed packets");
+                            }
+                        }
+                        else if (ip_header->ip_p == IPPROTO_TCP)
+                        {
+                            if (const auto result = process_tcp_packet(*buffer_ptr, true);
+                                result && result->action == packet_filter::packet_action::action_type::pass)
+                            {
+                                to_adapters.push_back(std::move(buffer_ptr));
+                            }
+                            else if (result && result->action == packet_filter::packet_action::action_type::revert)
+                            {
+                                to_mstcp.push_back(std::move(buffer_ptr));
+                            }
+                            else
+                            {
+                                // Should always have a result for postponed packets
+                                assert(false && "process_tcp_packet should always return a result for postponed packets");
+                            }
+                        }
+                    }
+                    else if (ether_type == ETH_P_IPV6)
+                    {
+                        if (const auto result = process_udp_packet_v6(*buffer_ptr, true);
                             result && result->action == packet_filter::packet_action::action_type::pass)
                         {
                             to_adapters.push_back(std::move(buffer_ptr));
@@ -1926,31 +2918,8 @@ namespace proxy
                         }
                         else
                         {
-                            // Should always have a result for postponed packets
-                            assert(false && "process_udp_packet should always return a result for postponed packets");
+                            assert(false && "process_udp_packet_v6 should always return a result for postponed packets");
                         }
-                    }
-                    else if (ip_header->ip_p == IPPROTO_TCP)
-                    {
-                        if (const auto result = process_tcp_packet(*buffer_ptr, true);
-                            result && result->action == packet_filter::packet_action::action_type::pass)
-                        {
-                            to_adapters.push_back(std::move(buffer_ptr));
-                        }
-                        else if (result && result->action == packet_filter::packet_action::action_type::revert)
-                        {
-                            to_mstcp.push_back(std::move(buffer_ptr));
-                        }
-                        else
-                        {
-                            // Should always have a result for postponed packets
-                            assert(false && "process_tcp_packet should always return a result for postponed packets");
-                        }
-                    }
-                    else
-                    {
-                        // Only TCP/UDP packets should be queued for deferred processing
-                        assert(false && "Only TCP/UDP packets should be queued for deferred processing");
                     }
                 }
 
@@ -2070,6 +3039,55 @@ namespace proxy
         * - 224.0.0.0/4     (Multicast)
         * - 169.254.0.0/16  (Link-local / APIPA)
         */
+        void add_lan_dns_redirect_filters_v4()
+        {
+            static constexpr std::array<std::pair<const char*, const char*>, 5> local_ranges{ {
+                {"10.0.0.0",    "255.0.0.0"},
+                {"172.16.0.0",  "255.240.0.0"},
+                {"192.168.0.0", "255.255.0.0"},
+                {"224.0.0.0",   "240.0.0.0"},
+                {"169.254.0.0", "255.255.0.0"}
+            } };
+
+            const auto to_subnet = [](const char* address, const char* mask) {
+                return net::ip_subnet{
+                    net::ip_address_v4{address},
+                    net::ip_address_v4{mask}
+                };
+            };
+
+            const auto add_dns_filters_for_protocol = [this, &to_subnet](const uint8_t protocol) {
+                for (const auto& [address, mask] : local_ranges)
+                {
+                    const auto subnet = to_subnet(address, mask);
+
+                    ndisapi::filter<net::ip_address_v4> in_filter;
+                    in_filter
+                        .set_protocol(protocol)
+                        .set_direction(ndisapi::direction_t::in)
+                        .set_action(ndisapi::action_t::redirect)
+                        .set_source_address(subnet)
+                        .set_source_port(std::make_pair<uint16_t, uint16_t>(53, 53));
+                    static_filters_.add_filter_front(in_filter);
+
+                    ndisapi::filter<net::ip_address_v4> out_filter;
+                    out_filter
+                        .set_protocol(protocol)
+                        .set_direction(ndisapi::direction_t::out)
+                        .set_action(ndisapi::action_t::redirect)
+                        .set_dest_address(subnet)
+                        .set_dest_port(std::make_pair<uint16_t, uint16_t>(53, 53));
+                    static_filters_.add_filter_front(out_filter);
+                }
+            };
+
+            add_dns_filters_for_protocol(IPPROTO_UDP);
+            add_dns_filters_for_protocol(IPPROTO_TCP);
+
+            NETLIB_LOG(log_level::info,
+                "LAN bypass DNS exception enabled - local DNS traffic will still be inspected.");
+        }
+
         void add_lan_passover_filters_v4()
         {
             // List of local IPv4 address ranges (address + subnet mask)

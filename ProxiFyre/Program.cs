@@ -18,6 +18,10 @@ namespace ProxiFyre
     /// </summary>
     public class ProxiFyreService
     {
+        private const string DnsHijackEnvVar = "PROXIFYRE_DNS_HIJACK";
+        private const string FakeIpEnabledEnvVar = "PROXIFYRE_FAKEIP_ENABLED";
+        private const string FakeIpRangesEnvVar = "PROXIFYRE_FAKEIP_RANGES";
+
         /// <summary>
         /// NLog logger instance for logging service events.
         /// </summary>
@@ -57,6 +61,8 @@ namespace ProxiFyre
             _logLevel = Enum.TryParse<LogLevel>(serviceSettings.LogLevel, true, out var globalLogLevel)
                 ? globalLogLevel
                 : LogLevel.Info;
+
+            ConfigureDnsHijackAndFakeIp(serviceSettings);
 
             // Get an instance of the Socksifier
             _socksify = Socksifier.Socksifier.GetInstance(_logLevel);
@@ -143,6 +149,42 @@ namespace ProxiFyre
             }
         }
 
+        /// <summary>
+        /// Configures DNS hijack and fake IP settings for the unmanaged router.
+        /// </summary>
+        /// <param name="serviceSettings">The parsed service settings.</param>
+        private static void ConfigureDnsHijackAndFakeIp(ProxiFyreSettings serviceSettings)
+        {
+            var dnsHijackEnabled = serviceSettings.Dns?.Hijack == true;
+            var fakeIpEnabled = serviceSettings.FakeIp?.Enabled == true;
+            var fakeIpRanges = (serviceSettings.FakeIp?.Ranges ?? new List<string>())
+                .Where(range => !string.IsNullOrWhiteSpace(range))
+                .Distinct(StringComparer.OrdinalIgnoreCase)
+                .ToList();
+
+            if (fakeIpEnabled && fakeIpRanges.Count == 0)
+                fakeIpRanges.Add("198.18.0.0/15");
+
+            Environment.SetEnvironmentVariable(
+                DnsHijackEnvVar,
+                dnsHijackEnabled ? "1" : null,
+                EnvironmentVariableTarget.Process);
+            Environment.SetEnvironmentVariable(
+                FakeIpEnabledEnvVar,
+                fakeIpEnabled ? "1" : null,
+                EnvironmentVariableTarget.Process);
+            Environment.SetEnvironmentVariable(
+                FakeIpRangesEnvVar,
+                fakeIpRanges.Count > 0 ? string.Join(";", fakeIpRanges) : null,
+                EnvironmentVariableTarget.Process);
+
+            if (dnsHijackEnabled && _logLevel >= LogLevel.Info)
+                LoggerInstance.Info("DNS hijack is enabled.");
+
+            if (fakeIpEnabled && _logLevel >= LogLevel.Info)
+                LoggerInstance.Info($"FakeIP is enabled with ranges: {string.Join(", ", fakeIpRanges)}");
+        }
+
         //{
         //    "logLevel": "Warning",
         //    "proxies": [
@@ -191,12 +233,15 @@ namespace ProxiFyre
             /// <param name="proxies">The list of proxy application settings.</param>
             /// <param name="excludedList">The list of process names or paths to exclude from proxying.</param>
             /// <param name="bypassLan">Whether to bypass LAN traffic.</param>
-            public ProxiFyreSettings(string logLevel, List<AppSettings> proxies, List<string> excludedList = null, bool bypassLan = false)
+            public ProxiFyreSettings(string logLevel, List<AppSettings> proxies, List<string> excludedList = null,
+                bool bypassLan = false, DnsSettings dns = null, FakeIpSettings fakeIp = null)
             {
                 LogLevel = logLevel;
                 Proxies = proxies;
                 ExcludedList = excludedList ?? new List<string>();
                 BypassLan = bypassLan;
+                Dns = dns ?? new DnsSettings();
+                FakeIp = fakeIp ?? new FakeIpSettings();
             }
 
             /// <summary>
@@ -220,6 +265,68 @@ namespace ProxiFyre
             /// </summary>
             [JsonProperty("bypassLan", NullValueHandling = NullValueHandling.Ignore)]
             public bool BypassLan { get; }
+
+            /// <summary>
+            /// Gets DNS hijack settings.
+            /// </summary>
+            [JsonProperty("dns", NullValueHandling = NullValueHandling.Ignore)]
+            public DnsSettings Dns { get; }
+
+            /// <summary>
+            /// Gets fake IP settings.
+            /// </summary>
+            [JsonProperty("fakeip", NullValueHandling = NullValueHandling.Ignore)]
+            public FakeIpSettings FakeIp { get; }
+        }
+
+        /// <summary>
+        /// Represents DNS hijack settings.
+        /// </summary>
+        private class DnsSettings
+        {
+            /// <summary>
+            /// Initializes a new instance of the <see cref="DnsSettings"/> class.
+            /// </summary>
+            /// <param name="hijack">Whether DNS hijack is enabled.</param>
+            public DnsSettings(bool hijack = false)
+            {
+                Hijack = hijack;
+            }
+
+            /// <summary>
+            /// Gets a value indicating whether DNS hijack is enabled.
+            /// </summary>
+            [JsonProperty("hijack", NullValueHandling = NullValueHandling.Ignore)]
+            public bool Hijack { get; }
+        }
+
+        /// <summary>
+        /// Represents fake IP settings.
+        /// </summary>
+        private class FakeIpSettings
+        {
+            /// <summary>
+            /// Initializes a new instance of the <see cref="FakeIpSettings"/> class.
+            /// </summary>
+            /// <param name="enabled">Whether fake IP is enabled.</param>
+            /// <param name="ranges">The fake IP CIDR ranges.</param>
+            public FakeIpSettings(bool enabled = false, List<string> ranges = null)
+            {
+                Enabled = enabled;
+                Ranges = ranges ?? new List<string>();
+            }
+
+            /// <summary>
+            /// Gets a value indicating whether fake IP is enabled.
+            /// </summary>
+            [JsonProperty("enabled", NullValueHandling = NullValueHandling.Ignore)]
+            public bool Enabled { get; }
+
+            /// <summary>
+            /// Gets the fake IP CIDR ranges.
+            /// </summary>
+            [JsonProperty("ranges", NullValueHandling = NullValueHandling.Ignore)]
+            public List<string> Ranges { get; }
         }
 
         /// <summary>
